@@ -241,7 +241,8 @@ class PayPalClient:
     # ---------- Payouts v1 ----------
 
     def payout_to_worker(self, email, amount, currency="USD", note=""):
-        """จ่ายเงินให้ worker — sync_mode=true ตอบทันทีไม่ต้อง poll."""
+        """จ่ายเงินให้ worker — async mode (PayPal เลิกให้ใช้ sync_mode กับ integration ใหม่)
+        ส่ง batch แล้ว poll สถานะจนกว่าจะ SUCCESS/FAILED (timeout ~60 วิ)."""
         if self.mock:
             batch_id = _fake_id()
             self._payouts[batch_id] = {"status": "SUCCESS", "receiver": email, "amount": f"{amount:.2f}"}
@@ -264,6 +265,18 @@ class PayPalClient:
                 }
             ],
         }
-        res = self._post("/v1/payments/payouts?sync_mode=true", payload)
+        res = self._post("/v1/payments/payouts", payload)
         header = res.get("batch_header", {})
-        return {"batch_id": header.get("payout_batch_id", ""), "status": header.get("batch_status", "")}
+        payout_batch_id = header.get("payout_batch_id", "")
+        # poll สถานะ batch (async) — ปกติ sandbox เสร็จในไม่กี่วินาที
+        status = header.get("batch_status", "PENDING")
+        for _ in range(12):
+            if status in ("SUCCESS", "DENIED", "CANCELED"):
+                break
+            time.sleep(5)
+            try:
+                st = self._get(f"/v1/payments/payouts/{payout_batch_id}")
+                status = st.get("batch_header", {}).get("batch_status", status)
+            except PayPalError:
+                break
+        return {"batch_id": payout_batch_id, "status": status}
