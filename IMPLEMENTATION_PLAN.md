@@ -1,7 +1,17 @@
 # Implementation Plan — JudgePay PayPal Edition
 **อ้างอิง:** AUDIT_REPORT.md → CODE_REVIEW_P0P3.md → Issue #1 + GPT second-pass
-**สถานะ:** แผนรอเจ้าของอนุมัติ — **ห้ามแก้โค้ด / ห้ามใช้เงินจริงจนกว่าจะอนุมัติ**
-**หลักการ:** Sandbox-only ตลอด Phase A; ป้าย "simulated money" ทุกหน้าจอเงิน
+
+## ✅ Implementation status (2026-10-11) — Phase A เสร็จ, รอรีวิวก่อน push
+ทำตามลำดับ A1 → A3 → A2 → A4 → A5 → A6 → A7 ครบทุกข้อ (โค้ดอยู่ branch ท้องถิ่น
+`~/workspace/judgepay-paypal/`, **ยังไม่ push**). Regression: **33/33 ผ่าน**
+(`pytest tests/`, mock mode). E2E ผ่าน CLI จริง: create → confirm → submit →
+judge (91/100, ไม่แตะเงิน) → settle (มนุษย์ยืนยัน) → COMPLETED → reconcile
+ยืนยันตรงกับ PayPal mock. Live guard ตรวจแล้ว: `PAYPAL_MODE=live` ถูกบล็อก
+เว้นแต่ `JUDGEPAY_ALLOW_LIVE=1`. DB เก่า migrate อัตโนมัติ (ข้อมูลเดิมไม่หาย).
+ดูรายละเอียดไฟล์ที่เปลี่ยนท้ายเอกสาร.
+
+**สถานะเดิมของแผน:** แผนรอเจ้าของอนุมัติ — **ห้ามแก้โค้ด / ห้ามใช้เงินจริงจนกว่าจะอนุมัติ**
+→ อนุมัติแล้ว (GPT work order 2026-10-11 06:46) เฉพาะ Phase A / Sandbox เท่านั้น
 
 ---
 
@@ -118,3 +128,45 @@
 ## ลำดับที่ GPT อนุมัติ (สรุป)
 A1 → A2 → A3 → A4 → A5 → A6 → A7 — ทำตามนี้ก่อนเดโม่; Phase B ทั้งหมดคือ
 blocker ก่อนเงินจริง ห้ามข้าม
+
+---
+
+## ไฟล์ที่เปลี่ยน/สร้างใน Phase A (2026-10-11)
+
+**สร้างใหม่:**
+- `judgepay_paypal/auth.py` — `require_auth` (hmac.compare_digest, 403 JSON),
+  `rate_limited` (30/min), login/logout session + CSRF
+- `judgepay_paypal/policy.py` — fail-closed policy แหล่งเดียว
+  (thresholds 80/60, hard-fail 4 ข้อ, normalize_verdict, band_for)
+- `tests/conftest.py`, `tests/test_auth.py`, `tests/test_settlement.py`,
+  `tests/test_judge_policy.py` — 33 tests
+
+**แก้ไข:**
+- `judgepay_paypal/store.py` — คอลัมน์ `owner_id`, `worker_email_locked`,
+  `acceptance_criteria`, `last_paypal_op` (+ migrate DB เก่า),
+  `claim_for_settlement()` (atomic UPDATE, rowcount==1),
+  สถานะใหม่ JUDGED/NEEDS_REVIEW/SETTLING/NEEDS_RECONCILIATION
+- `judgepay_paypal/escrow.py` — แยก `judge_only()` / `settle_approved()`,
+  HMAC confirmation token (ผูก task_id|amount|currency|recipient|verdict|score
+  + expiry 30 นาที), `_assert_payment_invariants()` ก่อน capture,
+  recipient lock, `MAX_OUTPUT_LEN=20000`, `manual_evaluate()`, `reconcile()`,
+  payout ไม่ SUCCESS → NEEDS_RECONCILIATION (ไม่ mark COMPLETED)
+- `judgepay_paypal/paypal_client.py` — live guard, `get_authorization`
+  คืน amount/currency, `get_payout_batch()`, `PAYPAL_MOCK_PAYOUT_STATUS` test seam
+- `judgepay_paypal/judge.py` — mock verdict ใช้กฎ >=70 (ตรง LLM prompt)
+- `judgepay_paypal/cli.py` — `judge` (ไม่แตะเงิน), `settle`, `reconcile`,
+  `evaluate` (manual, ไม่จ่ายทันที), `--criteria`, ต้องมี JUDGEPAY_AUTH_TOKEN
+- `app.py` — auth ทุก POST (create/confirm/submit/judge/settle) + ownership,
+  หน้า `/task/<id>/review`, `/login`, ป้าย SANDBOX ทุกหน้า,
+  เลิกกลืน EscrowError, ฟอร์ม acceptance criteria, startup live guard
+- `.env.example` — `JUDGEPAY_AUTH_TOKEN`, `JUDGEPAY_HMAC_SECRET`,
+  `JUDGEPAY_ALLOW_LIVE`
+
+## Known limitations / ความเสี่ยงที่เหลือ (Phase B blockers — ยังไม่ทำ)
+1. Auth เป็น shared token ชั่วคราวสำหรับเดโม่ — ไม่ใช่ identity จริง
+2. LLM judge mode ยังไม่ถูกทดสอบ (มีแต่ mock)
+3. ไม่มี webhook/signature verify — reconcile เป็นแบบ manual/CLI เท่านั้น
+4. ไม่มี dispute/appeal/refund workflow
+5. Recipient ยังไม่ verified กับ PayPal (แค่ lock ไม่ให้เปลี่ยน)
+6. Rate limit เป็น in-memory (รีสตาร์ทแล้วรีเซ็ต)
+7. UNCLAIMED payout ยังไม่มี flow แจ้งเตือน/ตามเงินโดยเฉพาะ

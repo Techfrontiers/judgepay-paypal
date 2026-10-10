@@ -32,6 +32,12 @@ class PayPalClient:
         self.client_id = client_id or os.getenv("PAYPAL_CLIENT_ID", "")
         self.client_secret = client_secret or os.getenv("PAYPAL_CLIENT_SECRET", "")
         self.mode = (mode or os.getenv("PAYPAL_MODE", "sandbox")).lower()
+        # Phase A = sandbox เท่านั้น: ห้าม live เด็ดขาด เว้นแต่ปลดล็อกชัดแจ้ง
+        if self.mode == "live" and os.getenv("JUDGEPAY_ALLOW_LIVE") != "1":
+            raise PayPalError(
+                "live mode is BLOCKED (Phase A = sandbox only). "
+                "Set JUDGEPAY_ALLOW_LIVE=1 to override."
+            )
         env_mock = os.getenv("PAYPAL_MOCK", "").lower()
         # mock อัตโนมัติถ้าไม่มี credentials
         self.mock = (
@@ -188,14 +194,17 @@ class PayPalClient:
     # ---------- Payments v2 ----------
 
     def get_authorization(self, auth_id):
-        """poll สถานะ authorization."""
+        """poll สถานะ authorization — คืนยอด/สกุลเงินด้วย (ไว้ตรวจ invariant)."""
         if self.mock:
             a = self._auths.get(auth_id)
             if not a:
                 raise PayPalError(f"mock: unknown authorization {auth_id}")
-            return {"authorization_id": auth_id, "status": a["status"]}
+            return {"authorization_id": auth_id, "status": a["status"],
+                    "amount": a["amount"], "currency": a["currency"]}
         res = self._get(f"/v2/payments/authorizations/{auth_id}")
-        return {"authorization_id": res["id"], "status": res.get("status")}
+        amt = res.get("amount", {}) or {}
+        return {"authorization_id": res["id"], "status": res.get("status"),
+                "amount": amt.get("value"), "currency": amt.get("currency_code")}
 
     def capture_authorization(self, auth_id, amount=None, currency="USD"):
         """ปล่อยเงิน (approve) — final_capture=true, ใส่ PayPal-Request-Id กันยิงซ้ำ."""
@@ -245,9 +254,12 @@ class PayPalClient:
         ส่ง batch แล้ว poll สถานะจนกว่าจะ SUCCESS/FAILED (timeout ~60 วิ)."""
         if self.mock:
             batch_id = _fake_id()
-            self._payouts[batch_id] = {"status": "SUCCESS", "receiver": email, "amount": f"{amount:.2f}"}
+            # test seam: PAYPAL_MOCK_PAYOUT_STATUS=PENDING/UNCLAIMED/DENIED ไว้เทส path ไม่สำเร็จ
+            status = os.getenv("PAYPAL_MOCK_PAYOUT_STATUS", "SUCCESS").upper()
+            self._payouts[batch_id] = {"status": status, "receiver": email,
+                                       "amount": f"{amount:.2f}"}
             self._save_mock()
-            return {"batch_id": batch_id, "status": "SUCCESS"}
+            return {"batch_id": batch_id, "status": status}
         batch_id = f"judgepay-batch-{uuid.uuid4().hex}"
         payload = {
             "sender_batch_header": {
@@ -280,3 +292,16 @@ class PayPalClient:
             except PayPalError:
                 break
         return {"batch_id": payout_batch_id, "status": status}
+
+    def get_payout_batch(self, batch_id):
+        """poll สถานะ payout batch (ไว้ reconcile)."""
+        if self.mock:
+            p = self._payouts.get(batch_id)
+            if not p:
+                raise PayPalError(f"mock: unknown payout batch {batch_id}")
+            return {"batch_id": batch_id, "status": p["status"],
+                    "receiver": p.get("receiver"), "amount": p.get("amount")}
+        res = self._get(f"/v1/payments/payouts/{batch_id}")
+        header = res.get("batch_header", {}) or {}
+        return {"batch_id": header.get("payout_batch_id", batch_id),
+                "status": header.get("batch_status")}

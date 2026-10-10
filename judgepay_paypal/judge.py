@@ -53,11 +53,12 @@ def mock_evaluate(description, output):
     length_score = min(1.0, out_len / 200.0)
 
     score = round(100 * (0.7 * coverage + 0.3 * length_score))
-    verdict = "approve" if score >= 60 else "reject"
     reasoning = (
         f"mock judge: keyword coverage {coverage:.0%} ({len(brief_kw & out_kw)}/{len(brief_kw)}), "
         f"output length {out_len} chars -> score {score}"
     )
+    # verdict ผ่าน normalize ที่ escrow อีกชั้น; ที่นี่ใช้กฎเดียวกับ LLM prompt (>=70)
+    verdict = "approve" if score >= 70 else "reject"
     return {"score": score, "verdict": verdict, "reasoning": reasoning}
 
 
