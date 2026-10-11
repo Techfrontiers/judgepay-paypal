@@ -212,3 +212,30 @@ def test_void_raises_on_real_error(monkeypatch):
     c = PayPalClient(client_id="x", client_secret="y", mode="sandbox", mock=False)
     with pytest.raises(PayPalError, match="500"):
         c.void_authorization("AUTH123")
+
+
+def test_needs_review_reject_verdict_voids_on_human_approve(svc, monkeypatch):
+    """Regression (bug เจอจาก sandbox E2E จริง): NEEDS_REVIEW ที่ verdict=reject
+    เมื่อคนกด --approve-review ต้อง void คืน hold (REFUNDED) — ห้าม capture/จ่ายเงิน
+    ให้งานตกเกณฑ์เด็ดขาด."""
+    tid = flow_to_judged(svc)
+    # บังคับ score 65 -> verdict reject, NEEDS_REVIEW
+    monkeypatch.setattr(svc.judge, "evaluate",
+                        lambda d, o, **kw: {"score": 65, "verdict": "reject",
+                                            "reasoning": "mediocre work"})
+    svc.store.update_task(tid, status="SUBMITTED")  # judge ใหม่
+    jr = svc.judge_only(tid)
+    assert jr["status"] == "NEEDS_REVIEW"
+    assert jr["verdict"] == "reject"
+    token = svc.make_confirmation_token(tid)
+    with pytest.raises(EscrowError, match="human review"):
+        svc.settle_approved(tid, token)
+    r = svc.settle_approved(tid, token, human_approve=True)
+    assert r["status"] == "REFUNDED"
+    assert r["void_status"] == "VOIDED"
+    assert "capture_id" not in r or not r.get("capture_id")
+    t = svc.get_task(tid)
+    assert t["status"] == "REFUNDED"
+    assert not t["capture_id"]
+    auth = svc.paypal.get_authorization(t["authorization_id"])
+    assert auth["status"] == "VOIDED"

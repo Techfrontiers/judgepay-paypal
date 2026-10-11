@@ -476,10 +476,24 @@ class EscrowService:
                              "human_approve": bool(human_approve)},
                     actor=self._short_owner(task.get("owner_id")),
                     fail_closed=True)
+        # verdict ต้องชัดก่อนแตะเงิน: reject -> void คืน hold, approve -> capture+payout
+        # (กันจ่ายเงินให้งานตกเกณฑ์ผ่าน settle --approve-review — บั๊กที่เจอจาก sandbox E2E)
+        verdict = (task.get("judge_verdict") or "").lower()
+        if verdict not in ("approve", "reject"):
+            raise EscrowError(
+                f"cannot settle task {task_id}: no valid judge verdict "
+                f"(got {task.get('judge_verdict')!r}) — refusing to move money")
         # A4: atomic claim — ชนะคนเดียวเท่านั้น
         if not self.store.claim_for_settlement(task_id, ("JUDGED", "NEEDS_REVIEW")):
             raise EscrowError("settlement already in progress or completed by another process")
-        result = self._settle_approve(task_id, self._require(task_id))
+        if verdict == "reject":
+            result = self._settle_reject(task_id, {
+                "score": task.get("judge_score", 0),
+                "verdict": "reject",
+                "reasoning": task.get("judge_reasoning") or "",
+            })
+        else:
+            result = self._settle_approve(task_id, self._require(task_id))
         self._audit("SETTLE_RESULT", task_id=task_id,
                     correlation_id=f"judgepay-{task_id}-capture",
                     details={"status": result.get("status")},
