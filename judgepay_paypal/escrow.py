@@ -47,13 +47,31 @@ MAX_OUTPUT_LEN = 20000
 CONFIRM_TOKEN_TTL = 1800
 
 
-def _op_key(task_id, op_type):
-    """Idempotency key ที่เสถียร — derive จาก task + op_type เท่านั้น.
+def _op_key(task_id, op_type, resource_id=""):
+    """Idempotency key ที่เสถียร — ผูก task + PayPal resource + op_type.
 
     ห้ามสุ่มใหม่ตอน retry: PayPal ใช้ key นี้กันทำซ้ำ (capture: PayPal-Request-Id,
     payout: sender_batch_id จำ 30 วัน).
+
+    E2E 2026-10-11 เจอบั๊ก: key แบบ judgepay-{task}-{op} อย่างเดียวชนกันเมื่อ
+    DB ใหม่แต่ใช้ PayPal app เดิม (task_id เริ่มที่ 1 ใหม่) ภายในอายุ key ของ
+    PayPal -> PayPal replay ผล capture/payout ของ authorization เก่า เงินไม่ขยับ
+    แต่ DB บันทึก capture_id ผิด! ต้องผูก resource_id (authorization_id /
+    capture_id) ที่ globally unique เข้าไปด้วย — retry ของ auth เดิมได้ key เดิม
+    (replay ปลอดภัย), auth ใหม่ได้ key ใหม่ (ยิงจริง).
     """
+    if resource_id:
+        return f"judgepay-{task_id}-{resource_id}-{op_type}"
     return f"judgepay-{task_id}-{op_type}"
+
+
+def _op_resource(task, op_type):
+    """PayPal resource ที่ op นี้ผูกด้วย — เอาไปใส่ใน idempotency key."""
+    if op_type in ("capture", "void"):
+        return task.get("authorization_id") or ""
+    if op_type in ("payout", "refund"):
+        return task.get("capture_id") or ""
+    return ""
 
 
 def _request_hash(op_type, amount, currency, recipient=""):
@@ -777,7 +795,7 @@ class EscrowService:
         - dispute ยังเปิดอยู่ -> ต้อง resolve_dispute ก่อนเสมอ (refund ไม่ใช่
           ทางลัดข้าม dispute); dispute_resolution=True ใช้บันทึกว่า refund นี้
           เป็นการระงับข้อพิพาทที่ resolve แบบ upheld แล้วเท่านั้น
-        - ใช้ _execute_op (idempotent, key ต่อครั้ง: judgepay-{task}-refund-{seq})
+        - ใช้ _execute_op (idempotent, key ต่อครั้ง: judgepay-{task}-{capture}-refund-{seq})
         - timeout/ผลคลุมเครือ -> NEEDS_RECONCILIATION (ห้ามสรุปว่าล้มเหลว)
         - คืนเต็ม -> task REFUNDED; คืนบางส่วน -> task คงสถานะเดิม
         - นี่คืนจาก capture เท่านั้น — ดึงเงินจากผู้รับ payout คืนไม่ได้
@@ -847,10 +865,11 @@ class EscrowService:
             raise EscrowError(
                 f"refund amount {amount:.2f} invalid — refundable is "
                 f"{refundable:.2f} {cap_cur}")
-        # stable key ต่อครั้งที่ขอ refund — retry ด้วย key เดิมปลอดภัย
+        # stable key ต่อครั้งที่ขอ refund — ผูก capture_id ด้วย (กัน key ชนข้าม
+        # authorization แบบเดียวกับ capture/payout) — retry ด้วย key เดิมปลอดภัย
         seq = sum(1 for o in self.store.list_operations(task_id)
                   if o["op_type"] == "refund") + 1
-        key = f"judgepay-{task_id}-refund-{seq}"
+        key = f"judgepay-{task_id}-{capture_id}-refund-{seq}"
         # B5: audit ความตั้งใจ refund (fail-closed) — เขียนไม่ได้ -> ปฏิเสธก่อนเงินขยับ
         self._audit("REFUND_INTENT", task_id=task_id, correlation_id=key,
                     details={"amount": amount, "currency": cap_cur,
@@ -1041,7 +1060,8 @@ class EscrowService:
         """
         task_id = task["id"]
         ov = op_overrides or {}
-        key = ov.get("idempotency_key") or _op_key(task_id, op_type)
+        key = ov.get("idempotency_key") or _op_key(
+            task_id, op_type, _op_resource(task, op_type))
         amount = ov.get("amount", task["amount"])
         currency = ov.get("currency", task["currency"])
         recipient = ov.get("recipient", task.get("worker_email") or "")
@@ -1158,16 +1178,17 @@ class EscrowService:
         raise EscrowError(f"unknown op_type: {op_type}")
 
     def _reconcile_op(self, task, op):
-        """replay op ที่ค้างด้วย key เดิม — ปลอดภัย ไม่ทำซ้ำ."""
-        if op["op_type"] == "refund":
-            # B4: refund มีหลาย key ต่อ task — ใช้ key/amount ของ op ตัวนั้นเอง
-            return self._execute_op(
-                task, "refund", reconcile_mode=True,
-                op_overrides={"idempotency_key": op["idempotency_key"],
-                              "amount": op["amount"],
-                              "currency": op["currency"],
-                              "recipient": op["recipient"] or ""})
-        return self._execute_op(task, op["op_type"], reconcile_mode=True)
+        """replay op ที่ค้างด้วย key เดิมที่บันทึกไว้ — ปลอดภัย ไม่ทำซ้ำ.
+
+        ใช้ key จาก op row ตรงๆ (ไม่ derive ใหม่) กัน key หลุดถ้า task เปลี่ยน
+        ระหว่างทาง; ทุก op_type เหมือนกันหมด.
+        """
+        return self._execute_op(
+            task, op["op_type"], reconcile_mode=True,
+            op_overrides={"idempotency_key": op["idempotency_key"],
+                          "amount": op["amount"],
+                          "currency": op["currency"],
+                          "recipient": op["recipient"] or ""})
 
     # ---------- 5. หมดเวลา ----------
 

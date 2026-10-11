@@ -8,7 +8,7 @@ import threading
 import pytest
 
 from judgepay_paypal.escrow import (
-    EscrowError, EscrowService, _op_key, _request_hash,
+    EscrowError, EscrowService, _op_key, _op_resource, _request_hash,
 )
 from judgepay_paypal.paypal_client import PayPalClient
 from judgepay_paypal.store import TaskStore
@@ -24,7 +24,15 @@ def _settling_task(svc):
 
 
 def _op(svc, tid, op_type):
-    return svc.store.get_operation(_op_key(tid, op_type))
+    task = svc.get_task(tid)
+    return svc.store.get_operation(
+        _op_key(tid, op_type, _op_resource(task, op_type)))
+
+
+def _key_for(svc, tid, op_type):
+    """key ที่คาดหวัง — judgepay-{tid}-{resource}-{op} (ผูก PayPal resource)."""
+    task = svc.get_task(tid)
+    return _op_key(tid, op_type, _op_resource(task, op_type))
 
 
 # --- 1. ยิง capture ซ้ำด้วย key เดิม -> side effect ครั้งเดียว ---
@@ -41,7 +49,7 @@ def test_same_capture_twice_single_side_effect(svc):
     op = _op(svc, tid, "capture")
     assert op["status"] == "SUCCEEDED"
     assert op["paypal_ref"] == r1["capture_id"]
-    assert op["idempotency_key"] == f"judgepay-{tid}-capture"  # stable, ไม่สุ่ม
+    assert op["idempotency_key"] == _key_for(svc, tid, "capture")  # stable ไม่สุ่ม + ผูก auth
 
 
 # --- 2. สอง thread ชนกันที่ op เดียวกัน -> ยิงจริงครั้งเดียว ---
@@ -94,7 +102,7 @@ def test_timeout_after_capture_reconciles_without_duplicate(svc, monkeypatch):
 def test_crash_after_intent_reconcile_sends_once(svc):
     tid = _settling_task(svc)
     task = svc.get_task(tid)
-    key = _op_key(tid, "capture")
+    key = _op_key(tid, "capture", _op_resource(svc.get_task(tid), "capture"))
     # จำลอง crash: intent ถูกบันทึกแล้ว process ตายก่อนยิง PayPal
     # (hash ต้องตรงกับที่ _execute_op คำนวณจาก task จริง)
     svc.store.record_intent(
@@ -118,7 +126,7 @@ def test_crash_after_intent_reconcile_sends_once(svc):
 def test_crash_after_paypal_success_before_db_update(svc):
     tid = _settling_task(svc)
     task = svc.get_task(tid)
-    key = _op_key(tid, "capture")
+    key = _op_key(tid, "capture", _op_resource(svc.get_task(tid), "capture"))
     # PayPal ทำสำเร็จแล้ว แต่ app crash ก่อน mark SUCCEEDED (op ค้าง SENT)
     cap = svc.paypal.capture_authorization(task["authorization_id"], idempotency_key=key)
     svc.store.record_intent(
@@ -154,7 +162,7 @@ def test_retry_while_needs_reconciliation_refused(svc, monkeypatch):
 def test_same_key_different_transaction_refused(svc):
     tid = _settling_task(svc)
     task = svc.get_task(tid)
-    key = _op_key(tid, "capture")
+    key = _op_key(tid, "capture", _op_resource(svc.get_task(tid), "capture"))
     # แอบบันทึก intent ด้วยธุรกรรมอื่น (ยอดไม่ตรง)
     svc.store.record_intent(tid, "capture", key, "deadbeef" * 8,
                             amount=999.99, currency="USD", recipient="")
@@ -273,14 +281,14 @@ def test_reconcile_all_across_real_process_restart(tmp_path):
            "JUDGEPAY_AUTH_TOKEN": "test-operator-token",
            "JUDGEPAY_HMAC_SECRET": "test-hmac-secret"}
     setup_code = (
-        "from judgepay_paypal.escrow import EscrowService, _op_key, _request_hash;"
+        "from judgepay_paypal.escrow import EscrowService, _op_key, _op_resource, _request_hash;"
         "from judgepay_paypal.paypal_client import PayPalClient;"
         "from judgepay_paypal.store import TaskStore;"
         "from judgepay_paypal.judge import AIJudge;"
         "svc = EscrowService(PayPalClient(), TaskStore(), AIJudge(backend='mock'));"
         "r = svc.create_task('restart brief', 5.00, 'USD', 24, '', owner_id='o');"
         "tid = r['task_id']; svc.confirm_authorization(tid);"
-        "t = svc.store.get_task(tid); key = _op_key(tid, 'capture');"
+        "t = svc.store.get_task(tid); key = _op_key(tid, 'capture', _op_resource(t, 'capture'));"
         "svc.store.record_intent(tid, 'capture', key,"
         " _request_hash('capture', t['amount'], t['currency'], ''),"
         " amount=t['amount'], currency=t['currency'], recipient='');"
@@ -313,11 +321,11 @@ def test_settle_uses_stable_keys_end_to_end(svc):
     assert r["status"] == "COMPLETED"
     cap_op = _op(svc, tid, "capture")
     pay_op = _op(svc, tid, "payout")
-    assert cap_op["idempotency_key"] == f"judgepay-{tid}-capture"
-    assert pay_op["idempotency_key"] == f"judgepay-{tid}-payout"
+    assert cap_op["idempotency_key"] == _key_for(svc, tid, "capture")
+    assert pay_op["idempotency_key"] == _key_for(svc, tid, "payout")
     assert cap_op["status"] == "SUCCEEDED" and pay_op["status"] == "SUCCEEDED"
     # mock จำ batch ตาม sender_batch_id ที่เสถียร
-    assert f"judgepay-{tid}-payout" in svc.paypal._payout_idem
+    assert _key_for(svc, tid, "payout") in svc.paypal._payout_idem
 
 
 def test_parse_duplicate_link_real_paypal_error_shape():
@@ -334,3 +342,32 @@ def test_parse_duplicate_link_real_paypal_error_shape():
     assert _parse_duplicate_payout_link(real_err) == "UW9PA5HUJWAX6"
     # ไม่ใช่ duplicate -> None
     assert _parse_duplicate_payout_link("POST -> 500: INTERNAL_SERVER_ERROR") is None
+
+
+# --- E2E 2026-10-11: key ต้องผูก PayPal resource ---
+# บั๊กจริง: key แบบ judgepay-{task}-{op} ชนกันเมื่อ DB ใหม่แต่ใช้ PayPal app เดิม
+# (task_id เริ่มที่ 1 ใหม่) ภายในอายุ key ของ PayPal -> PayPal replay ผล capture
+# ของ authorization เก่า เงินไม่ขยับแต่ DB บันทึก capture_id ผิด!
+
+def test_key_binds_paypal_resource_no_cross_auth_replay(svc):
+    tid = _settling_task(svc)
+    auth1 = svc.get_task(tid)["authorization_id"]
+    k1 = _key_for(svc, tid, "capture")
+    assert auth1 and auth1 in k1  # key ผูก authorization
+    # จำลอง authorization ใหม่ (confirm ใหม่ / DB ถูกล้างแล้วสร้าง task ใหม่)
+    svc.store.update_task(tid, authorization_id="NEWAUTH123456789")
+    k2 = _key_for(svc, tid, "capture")
+    assert k2 != k1  # auth ใหม่ -> key ใหม่ -> PayPal ยิงจริง ไม่ replay
+    assert "NEWAUTH123456789" in k2
+
+
+def test_payout_key_binds_capture_id(svc):
+    tid = _settling_task(svc)
+    cap = svc._execute_op(svc.get_task(tid), "capture")
+    svc.store.update_task(tid, capture_id=cap["capture_id"])
+    cap1 = svc.get_task(tid)["capture_id"]
+    k1 = _key_for(svc, tid, "payout")
+    assert cap1 and cap1 in k1  # key ผูก capture
+    svc.store.update_task(tid, capture_id="NEWCAP123456789")
+    k2 = _key_for(svc, tid, "payout")
+    assert k2 != k1

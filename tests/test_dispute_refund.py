@@ -21,6 +21,12 @@ from tests.conftest import flow_to_judged, DESC, CRITERIA
 OWNER = "test-owner"
 
 
+def _refund_key(svc, tid, seq=1):
+    """refund key ตาม format ใหม่: ผูก capture_id กันชนข้าม authorization."""
+    cap_id = svc.get_task(tid)["capture_id"]
+    return f"judgepay-{tid}-{cap_id}-refund-{seq}"
+
+
 def _capture_task(svc, owner=OWNER, amount=25.00):
     """create -> confirm -> capture (ยังไม่ payout) — มี capture_id พร้อม refund."""
     r = svc.create_task(DESC, amount, "USD", 24, "buyer@example.com",
@@ -208,7 +214,7 @@ def test_timeout_then_reconcile_recovers(svc, monkeypatch):
     monkeypatch.setenv("PAYPAL_MOCK_FAIL_MODE", "timeout_after_refund")
     with pytest.raises(EscrowError, match="NEEDS_RECONCILIATION"):
         svc.refund_capture(tid, human_confirm=True, owner_id=OWNER)
-    op = svc.store.get_operation(f"judgepay-{tid}-refund-1")
+    op = svc.store.get_operation(_refund_key(svc, tid))
     assert op["status"] == "NEEDS_RECONCILIATION"  # ห้าม mark FAILED
     assert svc.get_task(tid)["status"] != "REFUNDED"
     assert svc.paypal._mock_calls["refund_exec"] == 1  # provider ทำไปแล้วครั้งเดียว
@@ -216,7 +222,7 @@ def test_timeout_then_reconcile_recovers(svc, monkeypatch):
     monkeypatch.delenv("PAYPAL_MOCK_FAIL_MODE")
     r = svc.reconcile(tid)
     assert svc.paypal._mock_calls["refund_exec"] == 1
-    assert svc.store.get_operation(f"judgepay-{tid}-refund-1")["status"] == "SUCCEEDED"
+    assert svc.store.get_operation(_refund_key(svc, tid))["status"] == "SUCCEEDED"
     assert svc.store.ledger_sum(tid, ["REFUND_SUCCEEDED"]) == pytest.approx(25.00)
     assert svc.get_task(tid)["status"] == "REFUNDED"
     assert any("refund" in a for a in r["actions"])
@@ -227,7 +233,7 @@ def test_timeout_then_reconcile_recovers(svc, monkeypatch):
 def test_crash_after_success_recovers_via_replay(svc):
     tid = _capture_task(svc)
     cap_id = svc.get_task(tid)["capture_id"]
-    key = f"judgepay-{tid}-refund-1"
+    key = _refund_key(svc, tid)
     # provider ประมวลผลสำเร็จแล้ว (มี refund_id ฝั่ง PayPal)
     pres = svc.paypal.refund_capture(cap_id, amount=25.00, currency="USD",
                                      idempotency_key=key)
@@ -254,11 +260,11 @@ def test_refund_definite_failure(svc, monkeypatch):
     monkeypatch.setenv("PAYPAL_MOCK_FAIL_MODE", "error_422_refund")
     with pytest.raises(EscrowError, match="FAILED"):
         svc.refund_capture(tid, human_confirm=True, owner_id=OWNER)
-    op = svc.store.get_operation(f"judgepay-{tid}-refund-1")
+    op = svc.store.get_operation(_refund_key(svc, tid))
     assert op["status"] == "FAILED"
     assert svc.get_task(tid)["status"] != "REFUNDED"
     assert svc.store.ledger_has(tid, "REFUND_FAILED",
-                                f"judgepay-{tid}-refund-1")
+                                _refund_key(svc, tid))
     assert svc.store.ledger_sum(tid, ["REFUND_SUCCEEDED"]) == 0
 
 
