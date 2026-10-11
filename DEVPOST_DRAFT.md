@@ -67,7 +67,7 @@ For real PayPal sandbox: `PAYPAL_MOCK=false` + sandbox `PAYPAL_CLIENT_ID`/`PAYPA
 PayPal Developer Platform (Orders, Payments, Payouts — sandbox), Python, Flask, SQLite, AG Grid. AI: mock/heuristic judge with OpenAI-compatible LLM interface (real-LLM path implemented, not yet exercised against a live model).
 
 ## Team
-TODO — names/handles of team members (solo or team).
+sydear (solo)
 
 ## Deadline note
 Submit on Devpost before **Nov 12, 2026, 2:00 PM PT** (Nov 13, 04:00 Bangkok time). Submission is done by sydear in the Devpost UI — the assistant does not submit on their behalf.
