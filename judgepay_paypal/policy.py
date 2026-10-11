@@ -10,9 +10,11 @@
 """
 
 import difflib
+import hashlib
+import json
 import re
 
-from .judge import _keywords
+from .judge import _keywords, POLICY_VERSION  # noqa: F401 (re-export: แหล่งเดียว)
 
 # --- thresholds: แหล่งเดียว ห้าม hardcode ค่าอื่นที่ไหน ---
 APPROVE_THRESHOLD = 80
@@ -90,3 +92,37 @@ def band_for(score):
     if score >= REVIEW_MIN:
         return "NEEDS_REVIEW"
     return "REJECT"
+
+
+def _canonical_criteria(criteria):
+    """normalize criteria ให้ deterministic ก่อน hash/เทียบ."""
+    norm = []
+    for c in criteria or []:
+        if not isinstance(c, dict):
+            continue
+        norm.append({"required": bool(c.get("required")),
+                     "text": str(c.get("text", ""))})
+    return norm
+
+
+def hash_criteria(criteria):
+    """hash ของ acceptance criteria ที่ freeze — จับได้ถ้าโดนแก้ย้อนหลัง."""
+    canon = json.dumps(_canonical_criteria(criteria), sort_keys=True,
+                       ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def criteria_evidence(criteria, output):
+    """หลักฐานประกอบการตัดสิน: keyword ที่เจอใน output ต่อแต่ละข้อบังคับ.
+
+    คืน {criterion_text: [matched keywords]} — ตรวจย้อนหลังได้ว่าแต่ละข้อ
+    ผ่านเพราะหลักฐานอะไร ไม่ใช่แค่ pass/fail ลอยๆ.
+    """
+    out_kw = _keywords(output or "")
+    ev = {}
+    for c in _canonical_criteria(criteria):
+        if not c["required"] or not c["text"]:
+            continue
+        kws = _keywords(c["text"])
+        ev[c["text"]] = sorted(kws & out_kw)
+    return ev

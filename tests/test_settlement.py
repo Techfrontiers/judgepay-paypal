@@ -159,7 +159,7 @@ def test_needs_review_requires_human(svc, monkeypatch):
     tid = flow_to_judged(svc)
     # บังคับ score 70 -> NEEDS_REVIEW
     monkeypatch.setattr(svc.judge, "evaluate",
-                        lambda d, o: {"score": 70, "verdict": "approve", "reasoning": "borderline"})
+                        lambda d, o, **kw: {"score": 70, "verdict": "approve", "reasoning": "borderline"})
     svc.store.update_task(tid, status="SUBMITTED")  # judge ใหม่
     jr = svc.judge_only(tid)
     assert jr["status"] == "NEEDS_REVIEW"

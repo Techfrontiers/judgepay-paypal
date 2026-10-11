@@ -105,6 +105,11 @@ _MIGRATIONS = (
     ("owner_id", "TEXT"),
     ("acceptance_criteria", "TEXT"),
     ("last_paypal_op", "TEXT"),
+    # B3: audit การตัดสิน — เกณฑ์/หลักฐาน/เวอร์ชัน ตรวจย้อนหลังได้
+    ("judge_version", "TEXT"),
+    ("criteria_hash", "TEXT"),
+    ("criteria_evidence", "TEXT"),
+    ("input_hash", "TEXT"),
 )
 
 

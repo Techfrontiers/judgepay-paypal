@@ -34,6 +34,7 @@ from .paypal_client import PayPalClient, PayPalError
 from .judge import AIJudge
 from .policy import (
     APPROVE_THRESHOLD, REVIEW_MIN, evaluate_policy, normalize_verdict,
+    hash_criteria, criteria_evidence,
 )
 from .payout_status import normalize_payout_item, aggregate_task_status
 
@@ -130,6 +131,10 @@ class EscrowService:
         # ปลอดภัยอยู่แล้ว)
         task = self.store.create_task(description, amount, currency, deadline_at,
                                       requester_email, owner_id, criteria_json)
+        # B3: freeze เกณฑ์ตั้งแต่สร้าง — judge จะเทียบ hash นี้อีกที
+        # (เกณฑ์โดนแก้ย้อนหลัง -> NEEDS_REVIEW)
+        self.store.update_task(task["id"],
+                               criteria_hash=hash_criteria(acceptance_criteria or []))
         try:
             order = self.paypal.create_order(
                 amount=amount,
@@ -217,6 +222,28 @@ class EscrowService:
             raise EscrowError(f"task {task_id} is {task['status']}, nothing to judge")
 
         criteria = self._load_criteria(task)
+        # B3: เกณฑ์ต้อง freeze ตั้งแต่สร้าง — โดนแก้ย้อนหลัง -> ส่งคนตรวจ
+        # (ไม่เดา ไม่ตัดสินด้วยเกณฑ์ที่อาจถูกสับเปลี่ยน)
+        current_hash = hash_criteria(criteria)
+        frozen_hash = task.get("criteria_hash")
+        if frozen_hash and frozen_hash != current_hash:
+            reason = ("acceptance criteria changed after creation "
+                      f"(frozen {frozen_hash[:12]}… != current {current_hash[:12]}…) "
+                      "— refusing to judge, human review required")
+            self.store.update_task(
+                task_id, status="NEEDS_REVIEW",
+                judge_score=0, judge_verdict="reject", judge_reasoning=reason,
+                judge_version=self.judge.version_info(),
+                criteria_evidence=json.dumps(
+                    criteria_evidence(criteria, task["worker_output"] or ""),
+                    ensure_ascii=False),
+            )
+            return {"success": True, "task_id": task_id, "verdict": "reject",
+                    "score": 0, "reasoning": reason, "status": "NEEDS_REVIEW",
+                    "next": "human decision required (criteria tampered)"}
+        if not frozen_hash:
+            self.store.update_task(task_id, criteria_hash=current_hash)
+
         fails = evaluate_policy(task["description"], criteria, task["worker_output"])
         if fails:
             verdict = {
@@ -226,18 +253,29 @@ class EscrowService:
                              + " — rejected without AI call",
             }
         else:
-            raw = self.judge.evaluate(task["description"], task["worker_output"] or "")
+            crit_text = "; ".join(
+                ("[required] " if c.get("required") else "") + c.get("text", "")
+                for c in criteria) or "(none)"
+            raw = self.judge.evaluate(task["description"],
+                                      task["worker_output"] or "",
+                                      criteria_text=crit_text)
+            # B3: LLM พัง -> fail-closed เป็น NEEDS_REVIEW (ห้าม approve/void จาก error)
+            if raw.get("judge_error"):
+                reason = str(raw.get("reasoning", "judge error"))
+                self._store_judgement(task_id, task, criteria, 0, "reject",
+                                      reason)
+                self.store.update_task(task_id, status="NEEDS_REVIEW")
+                return {"success": True, "task_id": task_id, "verdict": "reject",
+                        "score": 0, "reasoning": reason, "status": "NEEDS_REVIEW",
+                        "next": "human decision required (judge error, fail-closed)"}
             score = max(0, min(100, int(raw.get("score", 0))))
             v, r = normalize_verdict(score, raw.get("verdict", "reject"),
                                      str(raw.get("reasoning", "")))
             verdict = {"score": score, "verdict": v, "reasoning": r}
 
-        self.store.update_task(
-            task_id,
-            judge_score=verdict["score"],
-            judge_verdict=verdict["verdict"],
-            judge_reasoning=verdict["reasoning"],
-        )
+        self._store_judgement(task_id, task, criteria,
+                              verdict["score"], verdict["verdict"],
+                              verdict["reasoning"])
 
         if verdict["score"] >= APPROVE_THRESHOLD:
             self.store.update_task(task_id, status="JUDGED")
@@ -256,6 +294,24 @@ class EscrowService:
             "reasoning": verdict["reasoning"], "status": status, "next": nxt,
         }
 
+    def _store_judgement(self, task_id, task, criteria, score, verdict, reasoning):
+        """บันทึกผลตัดสินพร้อม audit trail (B3) — เกณฑ์/หลักฐาน/เวอร์ชัน/input hash."""
+        ev = criteria_evidence(criteria, task["worker_output"] or "")
+        inp = hashlib.sha256(
+            "|".join([task["description"] or "",
+                       json.dumps(criteria, sort_keys=True, ensure_ascii=False),
+                       task["worker_output"] or ""]).encode("utf-8")
+        ).hexdigest()
+        self.store.update_task(
+            task_id,
+            judge_score=score,
+            judge_verdict=verdict,
+            judge_reasoning=reasoning,
+            judge_version=self.judge.version_info(),
+            criteria_evidence=json.dumps(ev, ensure_ascii=False),
+            input_hash=inp,
+        )
+
     def manual_evaluate(self, task_id, approve):
         """คนตัดสินเอง (CLI): เก็บ verdict แล้วไปตาม band เดียวกัน — ไม่จ่ายเงินทันที."""
         task = self._require(task_id)
@@ -269,6 +325,7 @@ class EscrowService:
         self.store.update_task(
             task_id, judge_score=verdict["score"], judge_verdict=verdict["verdict"],
             judge_reasoning=verdict["reasoning"],
+            judge_version=f"manual:{self.judge.version_info()}",
         )
         if approve:
             self.store.update_task(task_id, status="JUDGED")

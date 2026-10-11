@@ -67,7 +67,7 @@ def test_bands_single_source_of_truth():
 def test_inconsistent_llm_output_normalized(svc, monkeypatch):
     # LLM บอก score 95 แต่ verdict reject -> ต้อง override เป็น approve -> JUDGED
     monkeypatch.setattr(svc.judge, "evaluate",
-                        lambda d, o: {"score": 95, "verdict": "reject",
+                        lambda d, o, **kw: {"score": 95, "verdict": "reject",
                                       "reasoning": "contradictory test"})
     r = svc.create_task(DESC, 25.00, "USD", 24, "", owner_id="o")
     tid = r["task_id"]
@@ -84,7 +84,7 @@ def test_adversarial_stuffing_rejected_no_ai(svc, monkeypatch):
     calls = []
     orig = svc.judge.evaluate
     monkeypatch.setattr(svc.judge, "evaluate",
-                        lambda d, o: calls.append(1) or orig(d, o))
+                        lambda d, o, **kw: calls.append(1) or orig(d, o))
     r = svc.create_task(DESC, 25.00, "USD", 24, "", owner_id="o")
     tid = r["task_id"]
     svc.confirm_authorization(tid)
