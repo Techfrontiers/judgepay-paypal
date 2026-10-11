@@ -179,7 +179,7 @@ def index():
     rows = "".join(
         f"<tr><td><a href='/task/{t['id']}'>#{t['id']}</a></td>"
         f"<td>{esc((t['description'] or '')[:60])}</td>"
-        f"<td>{esc(f'{t['amount']:.2f}')} {esc(t['currency'])}</td>"
+        f"<td>{esc('{:.2f}'.format(t['amount']))} {esc(t['currency'])}</td>"
         f"<td>{badge(t['status'])}</td>"
         f"<td>{esc(t['judge_score']) if t['judge_score'] is not None else '-'}</td>"
         f"<td>{esc((t['created_at'] or '')[:16].replace('T', ' '))}</td></tr>"

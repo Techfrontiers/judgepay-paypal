@@ -59,6 +59,8 @@ see Known limitations.)
 
 ## Setup
 
+**Python 3.11+** required (3.12 tested; the code avoids 3.12-only syntax).
+
 ```bash
 cd ~/workspace/judgepay-paypal
 python3 -m venv .venv && source .venv/bin/activate
