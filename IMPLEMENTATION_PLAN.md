@@ -1,7 +1,35 @@
 # Implementation Plan — JudgePay PayPal Edition
 **อ้างอิง:** AUDIT_REPORT.md → CODE_REVIEW_P0P3.md → Issue #1 + GPT second-pass
 
-## ✅ Implementation status (2026-10-11) — Phase A เสร็จ, รอรีวิวก่อน push
+## ✅ Phase A CLOSED — Sandbox Validation ผ่าน (2026-10-11)
+**Commits:** `e0963823` (Phase A A1–A7) → `037adbef` (fix void HTTP 204 + 2 tests)
+**Branch:** `main` (Techfrontiers/judgepay-paypal) — working tree ตรงกับ `037adbef` เป๊ะ
+(ตรวจ hash ทุกไฟล์แล้ว)
+**Regression:** `pytest tests/` = **35/35 ผ่าน** รันจริงบนโค้ด `037adbef` (mock mode)
+
+### หลักฐาน Sandbox E2E (PayPal API จริง, ไม่ใช่ mock)
+- order `65G04713TY848981P` ($1.00 USD, AUTHORIZE) → buyer อนุมัติ (API: APPROVED)
+- authorization `642909306S196335X` → capture `4FY74880HL962064J` (API: CAPTURED)
+- payout batch `NJL9RKEWPGE4A` (API: SUCCESS) → DB task = COMPLETED
+- ตรวจแยก 3 ฝ่าย (PayPal auth / PayPal batch / DB) ตรงกันทั้งหมด
+- judge ให้ 100/100 แล้ว **capture_id/payout_batch_id ว่าง** = พิสูจน์ว่า AI แตะเงินไม่ได้
+
+### แยกผลทดสอบ (ห้ามอ้างข้ามกลุ่ม)
+- **Unit/Mock (35 tests):** auth, HMAC, policy, atomic settle, fail-safe, 204 void — ผ่านจริง
+- **Sandbox E2E:** happy path + reject/void/reconcile — ผ่านจริง (PayPal sandbox)
+- **ยังไม่ได้ทดสอบจริง:** LLM judge mode, payout UNCLAIMED/FAILED ของจริง,
+  webhook (ยังไม่มี), refund API (ยังไม่มี), concurrent settle บน sandbox จริง
+
+### บั๊กที่แก้แล้ว
+- `void_authorization` รับแค่ HTTP 200/201 แต่ PayPal void สำเร็จตอบ **204**
+  → เจอจาก E2E จริง, แพตช์ + regression tests ใน `037adbef`
+
+### Known Limitations → Production: **NO-GO**
+- shared admin token (demo gate), rate limit in-memory, recipient ไม่ verified กับ PayPal
+- ไม่มี dispute/refund flow, ไม่มี webhook, ไม่มี audit trail
+- **ห้ามใช้เงินจริงจนกว่า Phase B blockers จะปิดครบ** (ดู PHASE_B_PLAN.md)
+
+## เดิม: Implementation status (2026-10-11) — Phase A เสร็จ, รอรีวิวก่อน push
 ทำตามลำดับ A1 → A3 → A2 → A4 → A5 → A6 → A7 ครบทุกข้อ (โค้ดอยู่ branch ท้องถิ่น
 `~/workspace/judgepay-paypal/`, **ยังไม่ push**). Regression: **33/33 ผ่าน**
 (`pytest tests/`, mock mode). E2E ผ่าน CLI จริง: create → confirm → submit →
