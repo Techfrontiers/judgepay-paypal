@@ -61,7 +61,7 @@ For real PayPal sandbox: `PAYPAL_MOCK=false` + sandbox `PAYPAL_CLIENT_ID`/`PAYPA
 - AI judge tested in mock/heuristic mode only — no real LLM evaluation run yet.
 - Refund/dispute flows mock-tested only — not run against PayPal sandbox.
 - Webhook receiver helpers exist and are unit-tested, but no webhook route is wired (Future Work).
-- Sandbox E2E verified: order → authorize → capture → payout (item UNCLAIMED for unregistered receiver), void on reject.
+- Sandbox E2E verified 2026-10-11: order → authorize → capture → payout (item UNCLAIMED for unregistered receiver), void on reject. Not re-run after final doc/security commits (PayPal integration code unchanged).
 
 ## Built with
 PayPal Developer Platform (Orders, Payments, Payouts — sandbox), Python, Flask, SQLite, AG Grid. AI: mock/heuristic judge with OpenAI-compatible LLM interface (real-LLM path implemented, not yet exercised against a live model).

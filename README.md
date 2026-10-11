@@ -136,6 +136,18 @@ python app.py   # http://localhost:5000  |  /dashboard = AG Grid
   (3) worker submits, (4) AI judge reasoning on screen, (5) approve → payout email /
   reject → void, (6) AG Grid dashboard.
 
+## Known limitations
+
+- Hackathon prototype — not production financial infrastructure; do not use with real money.
+- Auth is a single shared operator token (documented; no multi-user isolation claim).
+- AI judge tested in mock/heuristic mode only — no real LLM evaluation run yet.
+- Refund/dispute flows mock-tested only — not run against PayPal sandbox.
+- Webhook signature-verification helpers exist and are unit-tested, but no webhook
+  receiver route is wired (future work); state comes from API polling + reconcile.
+- Sandbox E2E verified 2026-10-11 (order → authorize → capture → payout;
+  void on reject). Not re-run after final doc/security commits
+  (PayPal integration code unchanged).
+
 ## Project layout
 
 ```
