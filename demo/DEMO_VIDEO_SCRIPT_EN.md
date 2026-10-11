@@ -19,16 +19,17 @@
 3. `confirm` → show authorization ID, status OPEN — "$1.00 is now held by PayPal. Not paid — locked."
 4. `submit` — worker submits a good product description
 5. `judge` → show verdict **approve**, score, and the AI's reasoning on screen — "The AI judges. But notice: no money moved yet."
-6. `settle` (human confirmation) → show capture ID + payout batch ID, batch status SUCCESS
+6. `settle` (human confirmation) → show capture ID + payout batch ID; then `payout-status` → show **item** status (not just batch SUCCESS — a batch can be SUCCESS while the item is UNCLAIMED)
 **Say:** "The worker submits. The AI judge reads the brief, checks the deliverable, scores it — pass. A human confirms — the AI can never move money on its own — and PayPal captures the held dollar and pays the worker."
 
 ## Shot 4 — Safety: the reject path (1:50–2:20)
 **Do (real commands):**
-1. New task → submit garbage ("ok done")
-2. `judge` → verdict **reject** → status NEEDS_REVIEW
+1. New task → submit a *borderline* output (long enough to pass the hard-fail policy, but mediocre quality — e.g. a thin 60-word description missing key criteria)
+2. `judge` → verdict **reject**, score in the 60s → status NEEDS_REVIEW (NOT auto-settled — a human must decide)
 3. `settle` without approval → show the refusal: "task needs explicit human review decision first"
 4. `settle --approve-review` → void → REFUNDED — "the hold is released, no money moved"
 **Say:** "Bad work? The judge rejects. And even then, settlement needs a human. Nothing moves on AI output alone. The requester loses nothing."
+> ⚠ Do NOT use obvious garbage like "ok done" here — that trips the policy hard-fail (score < 60) and auto-voids straight to REFUNDED, skipping NEEDS_REVIEW. The point of this shot is the *borderline* case where a human decision is required.
 
 ## Shot 5 — Closing: value (2:20–2:50)
 **Say:** "For buyers: pay for results, not promises — every dollar is traceable from lock to payout to refund. For workers: fair, criteria-based judgment instead of arbitrary rejection. JudgePay turns PayPal into a decision primitive for the agent economy — escrow, AI evaluation, and human-approved settlement in one flow. Built with PayPal Orders, Payments, and Payouts. Open source — link in the description."
@@ -43,7 +44,7 @@
 | 1 | Title card + diagram | — |
 | 2 | Architecture diagram | — |
 | 3 | Terminal: create → approval URL; browser: sandbox approval; terminal: confirm / submit / judge / settle; payout batch SUCCESS | order APPROVED, auth CAPTURED, batch SUCCESS |
-| 4 | Terminal: reject flow, settle refusal message, void → REFUNDED | NEEDS_REVIEW, refusal text, REFUNDED |
+| 4 | Terminal: reject flow (borderline output → NEEDS_REVIEW), settle refusal message, void → REFUNDED | NEEDS_REVIEW, refusal text, REFUNDED |
 | 5 | Dashboard + repo link | task rows with payment columns |
 
 ## System prep (before recording)

@@ -16,6 +16,7 @@ Phase A / sandbox only. กฎ:
 รัน:  python app.py   (แล้วเปิด http://localhost:5000)
 """
 
+import html
 import json
 import os
 import sys
@@ -89,8 +90,19 @@ BASE_HTML = """
 """
 
 
+def esc(v):
+    """Escape untrusted content for HTML interpolation.
+
+    app.py builds pages with f-strings (not Jinja {{ }}), so Jinja autoescape
+    does NOT apply — every untrusted value must pass through here before it
+    touches HTML. Covers: task brief/description, worker output, emails,
+    judge reasoning, criteria text, IDs, and flash messages from query args.
+    """
+    return html.escape("" if v is None else str(v), quote=True)
+
+
 def page(body, flash=""):
-    f = f'<div class="flash">{flash}</div>' if flash else ""
+    f = f'<div class="flash">{esc(flash)}</div>' if flash else ""
     authed = bool(session.get("authed"))
     authnav = '<a href="/logout">🔓 Logout</a>' if authed else '<a href="/login">🔑 Login</a>'
     html = BASE_HTML.replace("%%BODY%%", f + body)
@@ -100,7 +112,8 @@ def page(body, flash=""):
 
 
 def badge(status):
-    return f'<span class="badge {status}">{status}</span>'
+    s = esc(status)
+    return f'<span class="badge {s}">{s}</span>'
 
 
 def csrf_field():
@@ -165,11 +178,11 @@ def index():
     tasks = svc().list_tasks()["tasks"]
     rows = "".join(
         f"<tr><td><a href='/task/{t['id']}'>#{t['id']}</a></td>"
-        f"<td>{(t['description'] or '')[:60]}</td>"
-        f"<td>{t['amount']:.2f} {t['currency']}</td>"
+        f"<td>{esc((t['description'] or '')[:60])}</td>"
+        f"<td>{esc(f'{t['amount']:.2f}')} {esc(t['currency'])}</td>"
         f"<td>{badge(t['status'])}</td>"
-        f"<td>{t['judge_score'] if t['judge_score'] is not None else '-'}</td>"
-        f"<td>{t['created_at'][:16].replace('T', ' ')}</td></tr>"
+        f"<td>{esc(t['judge_score']) if t['judge_score'] is not None else '-'}</td>"
+        f"<td>{esc((t['created_at'] or '')[:16].replace('T', ' '))}</td></tr>"
         for t in tasks
     )
     return page(f"""
@@ -282,24 +295,33 @@ def detail(task_id):
         crits = json.loads(t.get("acceptance_criteria") or "[]")
         if crits:
             items = "".join(
-                f"<li>{'❗' if c.get('required') else '·'} {c.get('text', '')}</li>"
+                f"<li>{'❗' if c.get('required') else '·'} {esc(c.get('text', ''))}</li>"
                 for c in crits)
             criteria_html = f"<div class='card'><b>Acceptance criteria:</b><ul>{items}</ul></div>"
     except ValueError:
         pass
 
+    worker_box = ""
+    if t['worker_output']:
+        worker_box = (f"<div class='card'><b>Worker output:</b>"
+                      f"<pre style='background:#fff;color:#222'>{esc(t['worker_output'][:2000])}</pre></div>")
+    judge_box2 = ""
+    if t['judge_verdict']:
+        judge_box2 = (f"<div class='card'><b>AI judge:</b> score {esc(t['judge_score'])} → "
+                      f"{esc(t['judge_verdict']).upper()}<br><i>{esc(t['judge_reasoning'])}</i></div>")
+
     return page(f"""
 <h2>Task #{t['id']} {badge(t['status'])}</h2>
 <div class="card">
-<b>Brief:</b> {t['description']}<br>
-<b>Amount:</b> {t['amount']} {t['currency']} · <b>Deadline:</b> {t['deadline_at'][:16].replace('T',' ')}<br>
-<b>Order:</b> <code>{t['order_id']}</code> · <b>Auth:</b> <code>{t['authorization_id']}</code><br>
-<b>Capture:</b> <code>{t['capture_id']}</code> · <b>Payout batch:</b> <code>{t['payout_batch_id']}</code><br>
-<b>Requester:</b> {t['requester_email']} · <b>Worker (locked):</b> {t['worker_email']}
+<b>Brief:</b> {esc(t['description'])}<br>
+<b>Amount:</b> {esc(t['amount'])} {esc(t['currency'])} · <b>Deadline:</b> {esc((t['deadline_at'] or '')[:16].replace('T',' '))}<br>
+<b>Order:</b> <code>{esc(t['order_id'])}</code> · <b>Auth:</b> <code>{esc(t['authorization_id'])}</code><br>
+<b>Capture:</b> <code>{esc(t['capture_id'])}</code> · <b>Payout batch:</b> <code>{esc(t['payout_batch_id'])}</code><br>
+<b>Requester:</b> {esc(t['requester_email'])} · <b>Worker (locked):</b> {esc(t['worker_email'])}
 </div>
 {criteria_html}
-{t['worker_output'] and f"<div class='card'><b>Worker output:</b><pre style='background:#fff;color:#222'>{t['worker_output'][:2000]}</pre></div>" or ""}
-{t['judge_verdict'] and f"<div class='card'><b>AI judge:</b> score {t['judge_score']} → {t['judge_verdict'].upper()}<br><i>{t['judge_reasoning']}</i></div>" or ""}
+{worker_box}
+{judge_box2}
 {approve_box}{submit_box}{judge_box}{review_box}
 """, flash=msg)
 
@@ -312,9 +334,9 @@ def approve_link(task_id):
         return page("", flash=str(e))
     oid = t.get("order_id", "")
     url = f"https://www.sandbox.paypal.com/checkoutnow?token={oid}"
-    return page(f"<h2>PayPal approval</h2><p>Order <code>{oid}</code></p>"
-                f"<p><a class='btn' href='{url}' target='_blank'>Open in PayPal sandbox</a></p>"
-                f"<p><code>{url}</code></p>"
+    return page(f"<h2>PayPal approval</h2><p>Order <code>{esc(oid)}</code></p>"
+                f"<p><a class='btn' href='{esc(url)}' target='_blank'>Open in PayPal sandbox</a></p>"
+                f"<p><code>{esc(url)}</code></p>"
                 f"<p><a href='/task/{task_id}'>← back to task</a></p>")
 
 
@@ -333,7 +355,7 @@ def review(task_id):
     try:
         crits = json.loads(t.get("acceptance_criteria") or "[]")
         crit_items = "".join(
-            f"<li>{'❗ required' if c.get('required') else 'optional'}: {c.get('text', '')}</li>"
+            f"<li>{'❗ required' if c.get('required') else 'optional'}: {esc(c.get('text', ''))}</li>"
             for c in crits) or "<li>(none)</li>"
     except ValueError:
         crit_items = "<li>(unparseable)</li>"
@@ -345,27 +367,42 @@ def review(task_id):
     warn = ("<p style='color:#b71c1c'><b>⚠ Borderline score — no auto-settle. "
             "Your explicit decision is required.</b></p>"
             if t["status"] == "NEEDS_REVIEW" else "")
+    # Verdict-aware settlement text: reject -> void (never capture/payout).
+    # Must match settle_approved() behavior in escrow.py.
+    is_reject = (t.get("judge_verdict") or "").lower() == "reject"
+    if is_reject:
+        settle_desc = (
+            f"<b>Settlement confirmation</b> — the judge <b>rejected</b> this work "
+            f"(score {esc(t['judge_score'])}). Confirming will <b>void</b> the authorization "
+            f"and release the {float(t['amount']):.2f} {esc(t['currency'])} hold back to the "
+            f"requester. No money moves to the worker.")
+        settle_btn = "✓ Confirm — void &amp; release hold"
+    else:
+        settle_desc = (
+            f"<b>Settlement confirmation</b> — this button captures "
+            f"{float(t['amount']):.2f} {esc(t['currency'])} and pays "
+            f"<code>{esc(t['worker_email'])}</code>.")
+        settle_btn = "✓ Confirm — capture &amp; payout"
     return page(f"""
 <h2>👁 Review task #{t['id']} {badge(t['status'])}</h2>
 {warn}
-<div class="card"><b>Brief:</b> {t['description']}<br>
-<b>Amount:</b> {t['amount']:.2f} {t['currency']}<br>
-<b>Payout recipient (locked):</b> <code>{t['worker_email']}</code><br>
-<b>Authorization:</b> <code>{t['authorization_id']}</code></div>
+<div class="card"><b>Brief:</b> {esc(t['description'])}<br>
+<b>Amount:</b> {float(t['amount']):.2f} {esc(t['currency'])}<br>
+<b>Payout recipient (locked):</b> <code>{esc(t['worker_email'])}</code><br>
+<b>Authorization:</b> <code>{esc(t['authorization_id'])}</code></div>
 <div class="card"><b>Acceptance criteria:</b><ul>{crit_items}</ul></div>
 <div class="card"><b>Worker output:</b>
-<pre style='background:#fff;color:#222'>{(t['worker_output'] or '')[:4000]}</pre></div>
-<div class="card"><b>AI judge:</b> score {t['judge_score']} →
-{t['judge_verdict'].upper() if t['judge_verdict'] else '-'}<br>
-<i>{t['judge_reasoning']}</i></div>
+<pre style='background:#fff;color:#222'>{esc((t['worker_output'] or '')[:4000])}</pre></div>
+<div class="card"><b>AI judge:</b> score {esc(t['judge_score'])} →
+{esc(t['judge_verdict']).upper() if t['judge_verdict'] else '-'}<br>
+<i>{esc(t['judge_reasoning'])}</i></div>
 <div class="card" style="border-color:#2e7d32">
-<b>Settlement confirmation</b> — this button captures
-{t['amount']:.2f} {t['currency']} and pays <code>{t['worker_email']}</code>.
+{settle_desc}
 The confirmation is cryptographically bound to these exact values.<br><br>
 <form method="post" action="/task/{task_id}/settle">{csrf_field()}
 <input type="hidden" name="sig" value="{sig}">
 {human_box}
-<button class="btn go" type="submit">✓ Confirm — capture &amp; payout</button></form></div>
+<button class="btn go" type="submit">{settle_btn}</button></form></div>
 """)
 
 
@@ -441,6 +478,10 @@ def judge(task_id):
 @app.route("/dashboard")
 def dashboard():
     tasks = svc().list_tasks()["tasks"]
+    # Safe JSON for <script> context: escape '<' so a value like
+    # "</script><script>alert(1)</script>" cannot break out of the script block.
+    # (json.dumps alone does not escape '/'; \u003c is valid JSON and decoded
+    # identically by the JS parser.)
     data = json.dumps([{
         "id": t["id"], "description": (t["description"] or "")[:50],
         "amount": t["amount"], "currency": t["currency"], "status": t["status"],
@@ -449,7 +490,7 @@ def dashboard():
         "judge_score": t["judge_score"], "judge_verdict": t["judge_verdict"] or "",
         "worker_email": t["worker_email"] or "",
         "created_at": (t["created_at"] or "")[:16].replace("T", " "),
-    } for t in tasks])
+    } for t in tasks]).replace("<", "\\u003c")
     return render_template_string("""
 <!doctype html><html><head><meta charset="utf-8"><title>JudgePay Dashboard</title>
 <script src="https://cdn.jsdelivr.net/npm/ag-grid-community/dist/ag-grid-community.min.js"></script>
@@ -479,4 +520,11 @@ agGrid.createGrid(document.getElementById("grid"), gridOptions);
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=True)
+    # Demo server: debug and network exposure are opt-in, never default.
+    # JUDGEPAY_DEBUG=1 enables the Werkzeug debugger (local dev only);
+    # JUDGEPAY_HOST controls the bind address (default 127.0.0.1 = localhost only).
+    debug = os.getenv("JUDGEPAY_DEBUG", "0") == "1"
+    host = os.getenv("JUDGEPAY_HOST", "127.0.0.1")
+    if debug and host not in ("127.0.0.1", "localhost"):
+        raise SystemExit("refusing: JUDGEPAY_DEBUG=1 with non-localhost bind")
+    app.run(host=host, port=int(os.getenv("PORT", 5000)), debug=debug)

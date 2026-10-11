@@ -1,5 +1,9 @@
 # JudgePay PayPal Edition — Demo Video Script (under 3:00)
 
+> ⚠ SUPERSEDED — the canonical script is `DEMO_VIDEO_SCRIPT_EN.md` (used for the
+> recorded video). This Thai draft is kept for reference only and still mentions
+> the old `judge-settle` command (now split into `judge` + `settle`).
+>
 > ถ่ายตอน sandbox พร้อมแล้วเท่านั้น — ห้ามถ่ายด้วย mock mode
 > Format: screen recording + voiceover, 1080p, เสียงชัด, ไม่มีเพลงมีลิขสิทธิ์
 

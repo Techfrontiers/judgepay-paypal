@@ -7,7 +7,9 @@ OpenClaw USDC Hackathon) to **PayPal rails**, for the **PayPal AI Hackathon 2026
 
 The core idea is unchanged: money is **locked first**, a worker submits output, an **AI judge**
 evaluates quality, and funds move **only if the work passes**. What changed is the money rail —
-from smart contracts to the PayPal platform (Orders v2 + Payments v2 + Payouts v1 + Webhooks).
+from smart contracts to the PayPal platform (Orders v2 + Payments v2 + Payouts v1).
+(Webhook signature-verification helpers exist; no webhook receiver route is wired —
+see Known limitations.)
 
 ## Architecture
 
@@ -38,14 +40,14 @@ from smart contracts to the PayPal platform (Orders v2 + Payments v2 + Payouts v
 | `evaluate(approve=true)` → release USDC | `POST /v2/payments/authorizations/{id}/capture` (`final_capture=true`) → then `POST /v1/payments/payouts` to worker |
 | `evaluate(approve=false)` → refund USDC | `POST /v2/payments/authorizations/{id}/void` — hold released, money never moves |
 | `claimTimeout` → requester reclaims | `expire_task` → void after deadline |
-| on-chain events | PayPal webhooks (`PAYMENT.AUTHORIZATION.CREATED`, `PAYMENT.CAPTURE.COMPLETED`, …) |
+| on-chain events | PayPal API polling + reconcile (webhook receiver not wired — future work) |
 | `PRIVATE_KEY` signs transactions | OAuth2 client-credentials (server-side only) |
 
 ## Why this fits the hackathon brief
 
 - **Deep PayPal usage** (judging criterion: *Technological Implementation*): Orders v2,
-  Payments v2 (authorize / capture / void / reauthorize), Payouts v1, webhooks — not a
-  bolted-on pay button.
+  Payments v2 (authorize / capture / void), Payouts v1 — not a
+  bolted-on pay button. (Webhook receiver is future work; state comes from API + reconcile.)
 - **AI at the center** (*Innovation*): the AI judge is the only thing standing between
   locked money and payout. Money does not move on human clicks alone.
 - **Real problem, real audience** (*Potential Impact*): freelancers and clients who don't
@@ -62,7 +64,13 @@ cd ~/workspace/judgepay-paypal
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 1) โหมด mock (ไม่ต้องมี credentials — เดโม่ได้ทันที)
+# 0) secrets บังคับ (fail-closed ถ้าขาด — ดู judgepay_paypal/config.py)
+#    สร้างค่าจริงด้วย: python3 -c "import secrets; print(secrets.token_hex(32))"
+export JUDGEPAY_AUTH_TOKEN=<64-hex-chars>   # ประตู operator
+export JUDGEPAY_HMAC_SECRET=<64-hex-chars>   # ผูก confirmation token
+export FLASK_SECRET_KEY=<64-hex-chars>       # session/CSRF
+
+# 1) โหมด mock (ไม่ต้องมี PayPal credentials — เดโม่ได้ทันที)
 export PAYPAL_MOCK=true JUDGE_LLM=mock
 
 # 2) โหมด sandbox จริง — สร้าง app ที่ developer.paypal.com
@@ -88,8 +96,11 @@ jp confirm 1
 # 3. worker ส่งงาน
 jp submit 1 -o "This 350ml ceramic coffee mug is dishwasher-safe and ..." --worker-email worker@example.com
 
-# 4. AI ตัดสิน + settle อัตโนมัติ
-jp judge-settle 1
+# 4. AI ตัดสิน (ไม่แตะเงิน)
+jp judge 1
+
+# 5. คนยืนยันแล้ว settle (capture+payout ถ้าผ่าน, void ถ้าไม่ผ่าน)
+jp settle 1
 
 # ดูผล
 jp get 1
@@ -106,8 +117,9 @@ python app.py   # http://localhost:5000  |  /dashboard = AG Grid
 | `confirm <id>` | authorize after buyer approval (locks funds) |
 | `get <id>` | task details as JSON |
 | `submit <id> -o …` | worker submits output |
-| `evaluate <id> --approve/--reject` | manual settle (no AI) |
-| `judge-settle <id>` | AI judge evaluates → capture+payout **or** void |
+| `evaluate <id> --approve/--reject` | manual verdict (no AI), then settle path |
+| `judge <id>` | AI judge evaluates only — **no money moves** |
+| `settle <id> [--approve-review]` | human-confirmed settlement: capture+payout (approve) **or** void (reject) |
 | `expire <id>` | void + mark EXPIRED |
 | `list [--status …]` | list tasks |
 
@@ -129,7 +141,7 @@ judgepay_paypal/      # NEW — PayPal edition (this hackathon)
   paypal_client.py    # PayPal REST client + mock mode
   store.py            # SQLite task store
   judge.py            # AI judge (mock heuristic / OpenAI-compatible LLM)
-  escrow.py           # state machine: create→confirm→submit→judge-settle→expire
+  escrow.py           # state machine: create→confirm→submit→judge→settle→expire
   cli.py              # CLI mirroring the original command names
 app.py                # Flask UI + AG Grid dashboard
 scripts/              # ORIGINAL JudgePay (USDC/Base) — kept as history, untouched

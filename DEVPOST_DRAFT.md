@@ -35,7 +35,7 @@ JudgePay is a PayPal-native escrow with an AI judge in the middle:
 - **Payouts v1** — pays the worker; item-level status tracking (a batch marked SUCCESS does not mean the recipient was paid — we track each payout item to `SUCCESS` before marking a task `COMPLETED`).
 
 ## Architecture & tech stack
-Python + Flask + SQLite. Modules: `paypal_client` (PayPal REST + sandbox mock), `store` (durable ops/ledger/disputes/audit), `escrow` (state machine), `judge` (AI evaluation), `policy` (frozen criteria), `webhooks` (signature-verify/dedup helpers), `config`/`audit`/`logutil` (fail-closed config, append-only audit trail, scrubbed structured logging). CLI + AG Grid dashboard. 154 automated tests (mock/failure-injection/security), all green.
+Python + Flask + SQLite. Modules: `paypal_client` (PayPal REST + sandbox mock), `store` (durable ops/ledger/disputes/audit), `escrow` (state machine), `judge` (AI evaluation), `policy` (frozen criteria), `webhooks` (signature-verify/dedup helpers), `config`/`audit`/`logutil` (fail-closed config, append-only audit trail, scrubbed structured logging). CLI + AG Grid dashboard. 162 automated tests (mock/failure-injection/security/XSS), all green.
 
 ## Try it
 ```bash
@@ -51,7 +51,7 @@ python -m pytest tests/   # 154 tests
 For real PayPal sandbox: `PAYPAL_MOCK=false` + sandbox `PAYPAL_CLIENT_ID`/`PAYPAL_CLIENT_SECRET` (Payouts enabled on the app).
 
 ## Links
-- GitHub: https://github.com/Techfrontiers/judgepay-paypal (public, TODO: add open-source license file)
+- GitHub: https://github.com/Techfrontiers/judgepay-paypal (public, MIT License)
 - Demo video (< 3 min, YouTube): TODO
 - Live demo URL: TODO (or "run locally per instructions above")
 
