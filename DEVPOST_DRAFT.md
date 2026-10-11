@@ -46,7 +46,7 @@ export PAYPAL_MOCK=true JUDGE_LLM=mock
 export JUDGEPAY_AUTH_TOKEN=<32+ chars> JUDGEPAY_HMAC_SECRET=<32+ chars> FLASK_SECRET_KEY=<32+ chars>
 python -m judgepay_paypal.cli create -d "<brief>" -a 25
 # approve at the URL, then: confirm → submit → judge → settle
-python -m pytest tests/   # 154 tests
+python -m pytest tests/   # 162 tests
 ```
 For real PayPal sandbox: `PAYPAL_MOCK=false` + sandbox `PAYPAL_CLIENT_ID`/`PAYPAL_CLIENT_SECRET` (Payouts enabled on the app).
 
@@ -61,7 +61,7 @@ For real PayPal sandbox: `PAYPAL_MOCK=false` + sandbox `PAYPAL_CLIENT_ID`/`PAYPA
 - AI judge tested in mock/heuristic mode only — no real LLM evaluation run yet.
 - Refund/dispute flows mock-tested only — not run against PayPal sandbox.
 - Webhook receiver helpers exist and are unit-tested, but no webhook route is wired (Future Work).
-- Sandbox E2E verified 2026-10-11: order → authorize → capture → payout (item UNCLAIMED for unregistered receiver), void on reject. Not re-run after final doc/security commits (PayPal integration code unchanged).
+- Sandbox E2E verified 2026-10-11: order → authorize → capture → payout **batch** SUCCESS, but payout **item** UNCLAIMED (test receiver not a registered PayPal account — the worker did NOT receive the money; PayPal holds it 30 days then returns it). Void on reject. Not re-run after final doc/security commits (PayPal integration code unchanged).
 
 ## Built with
 PayPal Developer Platform (Orders, Payments, Payouts — sandbox), Python, Flask, SQLite, AG Grid. AI: mock/heuristic judge with OpenAI-compatible LLM interface (real-LLM path implemented, not yet exercised against a live model).
