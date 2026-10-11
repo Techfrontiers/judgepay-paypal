@@ -17,6 +17,12 @@ from functools import wraps
 
 from flask import g, jsonify, request, session
 
+from judgepay_paypal.audit import audit as _audit_append, AuditError
+from judgepay_paypal.logutil import get_logger, log_event
+import logging as _logging
+
+_log = get_logger("judgepay.auth")
+
 # จำกัด 30 mutating requests / นาที ต่อ token (กันยิงรัว)
 RATE_LIMIT = 30
 RATE_WINDOW = 60
@@ -46,6 +52,22 @@ def _csrf_ok():
     return bool(provided and expected) and hmac.compare_digest(provided, expected)
 
 
+def _audit_auth_fail(reason):
+    """audit การ auth ล้มเหลว — ห้ามบันทึกค่า token เด็ดขาด."""
+    try:
+        from judgepay_paypal.store import TaskStore
+        _audit_append(
+            TaskStore(), actor="anonymous", action="AUTH_FAILED",
+            target_type="route", target_id=request.path,
+            outcome="refused",
+            details={"reason": reason, "method": request.method,
+                     # ตั้งใจไม่บันทึกค่า token / session ใดๆ
+                     "had_token": bool(request.headers.get("X-Auth-Token")
+                                       or request.form.get("auth_token"))})
+    except AuditError as e:
+        log_event(_log, _logging.WARNING, "audit_write_failed", str(e))
+
+
 def require_auth(fn):
     """Decorator: ไม่มี token ที่ถูกต้อง -> 403 JSON."""
     @wraps(fn)
@@ -60,15 +82,19 @@ def require_auth(fn):
         )
         if provided:
             if not hmac.compare_digest(provided, expected):
+                _audit_auth_fail("bad-token")
                 return jsonify({"error": "forbidden"}), 403
             g.owner_id = owner_id_for(expected)
         elif session.get("authed") and session.get("owner_id") == owner_id_for(expected):
             g.owner_id = session["owner_id"]
         else:
+            _audit_auth_fail("missing-token")
             return jsonify({"error": "forbidden"}), 403
         if request.method == "POST" and not _csrf_ok():
+            _audit_auth_fail("csrf")
             return jsonify({"error": "forbidden: csrf check failed"}), 403
         return fn(*args, **kwargs)
+    wrapper._require_auth = True  # B5: ให้ route-audit test ตรวจได้
     return wrapper
 
 

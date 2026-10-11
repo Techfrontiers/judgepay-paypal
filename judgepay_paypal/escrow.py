@@ -32,6 +32,9 @@ import requests
 from .store import TaskStore, utcnow
 from .paypal_client import PayPalClient, PayPalError
 from .judge import AIJudge
+from .audit import audit as _audit_append, AuditError  # B5: audit trail
+from .logutil import get_logger, log_event  # B5: structured logging
+import logging as _logging
 from .policy import (
     APPROVE_THRESHOLD, REVIEW_MIN, evaluate_policy, normalize_verdict,
     hash_criteria, criteria_evidence,
@@ -119,6 +122,37 @@ class EscrowService:
         self.paypal = paypal or PayPalClient()
         self.store = store or TaskStore()
         self.judge = judge or AIJudge()
+        self._log = get_logger("judgepay.escrow")
+
+    # ---------- B5: audit helper ----------
+
+    @staticmethod
+    def _short_owner(owner_id):
+        """owner_id ย่อสำหรับ log — ไม่จำเป็นต้องเต็ม (เป็น hash อยู่แล้ว)."""
+        return f"owner:{(owner_id or '')[:16]}" if owner_id else "operator"
+
+    def _audit(self, action, task_id=None, outcome="ok", correlation_id="",
+               details=None, actor=None, fail_closed=False):
+        """เขียน audit แบบ fail-closed ตามสั่ง.
+
+        fail_closed=True -> เขียนไม่ได้ raise EscrowError ปฏิเสธ operation
+        (ใช้ก่อน money movement). False -> ลง stderr แล้วไปต่อ.
+        """
+        try:
+            return _audit_append(
+                self.store, actor or "operator", action,
+                target_type="task" if task_id else "",
+                target_id=task_id or "", outcome=outcome,
+                correlation_id=correlation_id or "",
+                details=details or {})
+        except AuditError as e:
+            if fail_closed:
+                raise EscrowError(
+                    f"audit write failed — refusing operation: {e}")
+            log_event(self._log, _logging.WARNING, "audit_write_failed",
+                      str(e), task_id=task_id,
+                      correlation_id=correlation_id)
+            return None
 
     # ---------- 1. สร้าง task ----------
 
@@ -152,6 +186,12 @@ class EscrowService:
             # (ซื่อสัตย์กว่าลบทิ้ง: ให้เห็นว่าพังตรงไหน)
             raise EscrowError(f"PayPal order creation failed: {e}")
         task = self.store.update_task(task["id"], order_id=order["order_id"])
+        # B5: audit — สร้าง task สำเร็จ (ไม่มี secret ใน details)
+        self._audit("TASK_CREATED", task_id=task["id"], correlation_id=order["order_id"],
+                    details={"amount": amount, "currency": currency,
+                             "order_id": order["order_id"],
+                             "mock": self.paypal.mock},
+                    actor=self._short_owner(owner_id))
         return {
             "success": True,
             "task_id": task["id"],
@@ -172,10 +212,15 @@ class EscrowService:
         try:
             auth = self.paypal.authorize_order(oid)
         except PayPalError as e:
+            self._audit("AUTHORIZE_FAILED", task_id=task_id, outcome="failed",
+                        correlation_id=oid, details={"error": type(e).__name__})
             raise EscrowError(str(e))
         task = self.store.update_task(
             task_id, authorization_id=auth["authorization_id"], status="OPEN"
         )
+        self._audit("AUTHORIZED", task_id=task_id, correlation_id=oid,
+                    details={"authorization_id": auth["authorization_id"],
+                             "paypal_status": auth["status"]})
         return {
             "success": True,
             "task_id": task_id,
@@ -211,6 +256,9 @@ class EscrowService:
                 fields["worker_email"] = email
                 fields["worker_email_locked"] = 1
         task = self.store.update_task(task_id, **fields)
+        self._audit("WORK_SUBMITTED", task_id=task_id,
+                    details={"output_length": len(output or ""),
+                             "worker_email_locked": bool(task.get("worker_email_locked"))})
         return {
             "success": True,
             "task_id": task_id,
@@ -243,6 +291,7 @@ class EscrowService:
                     criteria_evidence(criteria, task["worker_output"] or ""),
                     ensure_ascii=False),
             )
+            self._audit("JUDGE_VERDICT", task_id=task_id, outcome="refused-criteria-tampered", details={"score": 0, "verdict": "reject"})
             return {"success": True, "task_id": task_id, "verdict": "reject",
                     "score": 0, "reasoning": reason, "status": "NEEDS_REVIEW",
                     "next": "human decision required (criteria tampered)"}
@@ -270,6 +319,9 @@ class EscrowService:
                 self._store_judgement(task_id, task, criteria, 0, "reject",
                                       reason)
                 self.store.update_task(task_id, status="NEEDS_REVIEW")
+                self._audit("JUDGE_VERDICT", task_id=task_id,
+                            outcome="judge-error-fail-closed",
+                            details={"score": 0, "verdict": "reject"})
                 return {"success": True, "task_id": task_id, "verdict": "reject",
                         "score": 0, "reasoning": reason, "status": "NEEDS_REVIEW",
                         "next": "human decision required (judge error, fail-closed)"}
@@ -293,6 +345,12 @@ class EscrowService:
         else:
             return self._settle_reject(task_id, verdict)
 
+        # B5: audit คำตัดสิน (score/verdict อย่างเดียว — ไม่เก็บ output ทั้งก้อน)
+        self._audit("JUDGE_VERDICT", task_id=task_id,
+                    details={"score": verdict["score"],
+                             "verdict": verdict["verdict"],
+                             "status": status,
+                             "judge_version": self.judge.version_info()})
         return {
             "success": True, "task_id": task_id,
             "verdict": verdict["verdict"], "score": verdict["score"],
@@ -391,10 +449,24 @@ class EscrowService:
             )
         # A3: ตรวจ invariant แบบ read-only ก่อนเงินขยับ (fail-closed)
         self._assert_payment_invariants(task)
+        # B5: audit ความตั้งใจ settle (fail-closed) — เขียนไม่ได้ -> ปฏิเสธ
+        # ก่อนแตะ claim/เงิน (task คงสถานะเดิม ไม่ค้าง SETTLING)
+        self._audit("SETTLE_INTENT", task_id=task_id,
+                    correlation_id=f"judgepay-{task_id}-capture",
+                    details={"amount": task["amount"], "currency": task["currency"],
+                             "recipient": task.get("worker_email"),
+                             "human_approve": bool(human_approve)},
+                    actor=self._short_owner(task.get("owner_id")),
+                    fail_closed=True)
         # A4: atomic claim — ชนะคนเดียวเท่านั้น
         if not self.store.claim_for_settlement(task_id, ("JUDGED", "NEEDS_REVIEW")):
             raise EscrowError("settlement already in progress or completed by another process")
-        return self._settle_approve(task_id, self._require(task_id))
+        result = self._settle_approve(task_id, self._require(task_id))
+        self._audit("SETTLE_RESULT", task_id=task_id,
+                    correlation_id=f"judgepay-{task_id}-capture",
+                    details={"status": result.get("status")},
+                    actor=self._short_owner(task.get("owner_id")))
+        return result
 
     def _assert_payment_invariants(self, task):
         """ตรวจก่อน capture: ยอด/สกุลเงินต้องตรงกับ authorization จริง,
@@ -480,6 +552,10 @@ class EscrowService:
                                    last_paypal_op=f"void:{task['authorization_id']}")
             raise
         self.store.update_task(task_id, status="REFUNDED")
+        self._audit("JUDGE_VERDICT", task_id=task_id,
+                    details={"score": verdict["score"], "verdict": "reject",
+                             "status": "REFUNDED",
+                             "judge_version": self.judge.version_info()})
         return {
             "success": True, "task_id": task_id,
             "verdict": "reject", "score": verdict["score"],
@@ -613,6 +689,10 @@ class EscrowService:
             self.add_dispute_evidence(task_id, d["opened_by"],
                                       evidence_note.strip(), owner_id=owner_id)
             d = self.store.get_dispute(task_id)
+        self._audit("DISPUTE_OPENED", task_id=task_id,
+                    correlation_id=f"dispute-{d['id']}",
+                    details={"dispute_id": d["id"], "reason": reason[:200]},
+                    actor=self._short_owner(owner_id or task.get("owner_id")))
         return {"success": True, "task_id": task_id,
                 "dispute_id": d["id"], "dispute_status": d["status"],
                 "task_status": "DISPUTED",
@@ -639,6 +719,11 @@ class EscrowService:
         if d["status"] == "OPEN":
             fields["status"] = "UNDER_REVIEW"
         self.store.update_dispute(d["id"], **fields)
+        self._audit("DISPUTE_EVIDENCE", task_id=task_id,
+                    correlation_id=f"dispute-{d['id']}",
+                    details={"dispute_id": d["id"],
+                             "evidence_count": len(ev)},
+                    actor=self._short_owner(owner_id or task.get("owner_id")))
         return {"success": True, "task_id": task_id, "dispute_id": d["id"],
                 "dispute_status": fields.get("status", d["status"]),
                 "evidence_count": len(ev)}
@@ -672,6 +757,11 @@ class EscrowService:
         self.store.ledger_append(
             task_id, "DISPUTE_CLOSED", ref=str(d["id"]),
             note=f"{decision} by {reviewer}: {(reason or '').strip()[:200]}")
+        self._audit("DISPUTE_RESOLVED", task_id=task_id,
+                    correlation_id=f"dispute-{d['id']}",
+                    details={"dispute_id": d["id"], "decision": decision,
+                             "reviewer": reviewer},
+                    actor=self._short_owner(owner_id or task.get("owner_id")))
         return {"success": True, "task_id": task_id, "dispute_id": d["id"],
                 "decision": decision, "dispute_status": new_status,
                 "task_status": "NEEDS_REVIEW",
@@ -761,6 +851,14 @@ class EscrowService:
         seq = sum(1 for o in self.store.list_operations(task_id)
                   if o["op_type"] == "refund") + 1
         key = f"judgepay-{task_id}-refund-{seq}"
+        # B5: audit ความตั้งใจ refund (fail-closed) — เขียนไม่ได้ -> ปฏิเสธก่อนเงินขยับ
+        self._audit("REFUND_INTENT", task_id=task_id, correlation_id=key,
+                    details={"amount": amount, "currency": cap_cur,
+                             "refundable": refundable,
+                             "reason": (reason or "")[:200],
+                             "dispute_resolution": bool(dispute_resolution)},
+                    actor=self._short_owner(owner_id or task.get("owner_id")),
+                    fail_closed=True)
         try:
             result = self._execute_op(
                 task, "refund",
@@ -776,9 +874,16 @@ class EscrowService:
                     currency=cap_cur, ref=key,
                     note=f"PayPal refused: {str(e)[:200]}{resolution_note}")
             raise
-        return self._apply_refund_result(
+        applied = self._apply_refund_result(
             task_id, result, cap_amt=cap_amt, cap_cur=cap_cur,
             extra_note=resolution_note)
+        self._audit("REFUND_RESULT", task_id=task_id, correlation_id=key,
+                    outcome=applied.get("status", "unknown").lower(),
+                    details={"refund_id": applied.get("refund_id") or "",
+                             "amount": applied.get("amount"),
+                             "currency": applied.get("currency")},
+                    actor=self._short_owner(owner_id or task.get("owner_id")))
+        return applied
 
     def _apply_refund_result(self, task_id, result, cap_amt=None, cap_cur="",
                              extra_note="", actions=None):
@@ -978,27 +1083,47 @@ class EscrowService:
             # INTENDED / FAILED / NEEDS_RECONCILIATION(reconcile) -> SENT
             # (SENT อยู่แล้วไม่ต้อง mark ซ้ำ — replay ปลอดภัย)
             self.store.transition_operation(key, "SENT")
+        # B5: audit ความตั้งใจยิง provider (fail-closed) — เขียนไม่ได้ -> ปฏิเสธก่อนเงินขยับ
+        self._audit("OP_INTENT", task_id=task_id, correlation_id=key,
+                    details={"op_type": op_type, "amount": amount,
+                             "currency": currency, "reconcile_mode": reconcile_mode},
+                    actor=self._short_owner(task.get("owner_id")),
+                    fail_closed=True)
         send = self._sender_for(task, op)
         try:
             result = send(key, op)
         except (requests.Timeout, requests.ConnectionError) as e:
             self.store.transition_operation(key, "NEEDS_RECONCILIATION")
+            self._audit("OP_RESULT", task_id=task_id, correlation_id=key,
+                        outcome="needs_reconciliation",
+                        details={"op_type": op_type, "reason": "timeout"})
             raise EscrowError(
                 f"{op_type}: timeout/connection ผลไม่ชัด "
                 f"-> NEEDS_RECONCILIATION: {e}")
         except PayPalError as e:
             if _is_definite_failure(e):
                 self.store.transition_operation(key, "FAILED")
+                self._audit("OP_RESULT", task_id=task_id, correlation_id=key,
+                            outcome="failed",
+                            details={"op_type": op_type})
                 raise EscrowError(f"{op_type}: ล้มเหลวชัดเจน -> FAILED: {e}")
             self.store.transition_operation(key, "NEEDS_RECONCILIATION")
+            self._audit("OP_RESULT", task_id=task_id, correlation_id=key,
+                        outcome="needs_reconciliation",
+                        details={"op_type": op_type, "reason": "ambiguous"})
             raise EscrowError(f"{op_type}: ผลคลุมเครือ -> NEEDS_RECONCILIATION: {e}")
         except Exception as e:
             # error อื่น (รวม bug) — ระวังไว้ก่อน ไม่ mark FAILED
             self.store.transition_operation(key, "NEEDS_RECONCILIATION")
+            self._audit("OP_RESULT", task_id=task_id, correlation_id=key,
+                        outcome="needs_reconciliation",
+                        details={"op_type": op_type, "reason": "unexpected"})
             raise EscrowError(
                 f"{op_type}: error ไม่คาดคิด -> NEEDS_RECONCILIATION: {e}")
         ref = _extract_ref(op_type, result)
         self.store.transition_operation(key, "SUCCEEDED", paypal_ref=ref)
+        self._audit("OP_RESULT", task_id=task_id, correlation_id=key,
+                    details={"op_type": op_type, "paypal_ref": ref or ""})
         return result
 
     def _sender_for(self, task, op):
@@ -1177,8 +1302,45 @@ class EscrowService:
             actions.append(f"status {task['status']} -> {new_status}")
         else:
             actions.append(f"status unchanged: {task['status']} (needs human decision)")
+        # B5: audit สรุป reconcile — actions ถูก truncate โดย scrub อยู่แล้ว
+        self._audit("RECONCILE", task_id=task_id,
+                    details={"final_status": new_status,
+                             "actions": actions[-20:]})
         return {"success": True, "task_id": task_id,
                 "status": new_status, "actions": actions}
+
+    def apply_webhook_refund(self, task_id, resource):
+        """ยืนยัน refund จาก webhook — sync ledger แบบ idempotent (B5).
+
+        เรียก get_refund แล้วยัดผ่าน _apply_refund_result (idempotent เหมือน B4).
+        ห้ามสั่ง refund ใหม่จาก webhook เด็ดขาด — ทำได้แค่ confirm เท่านั้น.
+        คืน list ของผลที่ sync สำเร็จ (ว่าง = ไม่มีอะไรต้อง sync).
+        """
+        task = self._require(task_id)
+        synced = []
+        for op in self.store.list_operations(task_id):
+            if op["op_type"] != "refund" or not op.get("paypal_ref"):
+                continue
+            rid = op["paypal_ref"]
+            if self.store.ledger_has(task_id, "REFUND_SUCCEEDED", rid):
+                continue
+            try:
+                r = self.paypal.get_refund(rid)
+            except (PayPalError, Exception) as e:
+                log_event(self._log, _logging.WARNING, "webhook_refund_lookup_failed",
+                          f"get_refund {rid}: {type(e).__name__}", task_id=task_id)
+                continue
+            if (r.get("status") or "").upper() != "COMPLETED":
+                continue
+            res = self._apply_refund_result(
+                task_id, {"refund_id": rid, "status": "COMPLETED",
+                          "amount": r.get("amount", {})})
+            synced.append(res)
+            self._audit("WEBHOOK_REFUND_SYNCED", task_id=task_id,
+                        correlation_id=rid,
+                        details={"refund_id": rid,
+                                 "amount": res.get("amount")})
+        return synced
 
     def reconcile_all(self):
         """ไล่ทุก operation ที่ค้างทั่ว DB — ใช้ตอน start / cron / หลัง restart."""

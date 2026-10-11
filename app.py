@@ -29,6 +29,7 @@ from judgepay_paypal.auth import (  # noqa: E402
     require_auth, rate_limited, current_owner_id,
     login_with_token, logout as auth_logout, new_csrf_token,
 )
+from judgepay_paypal.config import validate_startup_config  # noqa: E402
 
 # ---- startup guard: live ถูกบล็อกใน Phase A ----
 if os.getenv("PAYPAL_MODE", "sandbox").lower() == "live" \
@@ -37,6 +38,9 @@ if os.getenv("PAYPAL_MODE", "sandbox").lower() == "live" \
         "PAYPAL_MODE=live is BLOCKED (Phase A = sandbox only). "
         "Set JUDGEPAY_ALLOW_LIVE=1 to override."
     )
+
+# ---- B5: config validation แบบ fail-closed — ไม่ผ่าน -> ปฏิเสธ start ----
+_startup_config = validate_startup_config()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET_KEY", "judgepay-demo-secret")
@@ -125,6 +129,33 @@ def parse_criteria(text):
         required = line.startswith("!")
         out.append({"text": line[1:].strip() if required else line, "required": required})
     return out
+
+
+# ---------- B5: health / readiness (ไม่ต้อง auth, ไม่เปิดเผยข้อมูลภายใน) ----------
+
+@app.route("/healthz")
+def healthz():
+    """liveness — ตอบ ok อย่างเดียว ไม่แตะ DB/config."""
+    return jsonify({"ok": True})
+
+
+@app.route("/readyz")
+def readyz():
+    """readiness — ตรวจ DB + config แบบ boolean เท่านั้น (no internals)."""
+    checks = {"db": False, "config": False}
+    try:
+        from judgepay_paypal.store import TaskStore
+        TaskStore().list_tasks(limit=1)
+        checks["db"] = True
+    except Exception:
+        pass
+    try:
+        validate_startup_config()
+        checks["config"] = True
+    except RuntimeError:
+        pass
+    ready = all(checks.values())
+    return jsonify({"ready": ready, "checks": checks}), (200 if ready else 503)
 
 
 # ---------- read-only ----------

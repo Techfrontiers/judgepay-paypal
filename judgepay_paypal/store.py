@@ -143,6 +143,41 @@ DISPUTE_STATUSES = ("OPEN", "UNDER_REVIEW", "RESOLVED_UPHELD",
 # dispute ที่ยัง "ค้าง" — เปิดใหม่ซ้ำไม่ได้, settlement ถูกระงับ
 _OPEN_DISPUTE_STATUSES = ("OPEN", "UNDER_REVIEW")
 
+# B5: webhook event dedup + append-only audit trail
+# Rollback: DROP TABLE webhook_events / DROP TABLE audit_log
+# (tasks/operations/ledger ไม่กระทบ)
+# กฎ: event_id จาก PayPal ห้าม INSERT ก่อน verify ลายเซ็นผ่าน —
+# ไม่งั้นผู้โจมตี squat event_id ดัก event จริงได้ (ดู webhooks.py)
+WEBHOOK_EVENTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS webhook_events (
+    event_id TEXT PRIMARY KEY,       -- PayPal event id (UNIQUE = dedup)
+    event_type TEXT NOT NULL,
+    resource_id TEXT DEFAULT '',
+    task_id INTEGER,                 -- task ที่ผูกได้ (อาจ NULL ถ้าผูกไม่ได้)
+    status TEXT NOT NULL,            -- RECEIVED|PROCESSING|PROCESSED|FAILED
+    result TEXT DEFAULT '',          -- สรุปผลการประมวล (เช่น duplicate-ignored)
+    body_hash TEXT NOT NULL,         -- sha256(raw body) — เก็บ hash ไม่เก็บ body
+    received_at TEXT NOT NULL,
+    processed_at TEXT DEFAULT ''
+);
+"""
+
+AUDIT_LOG_SCHEMA = """
+CREATE TABLE IF NOT EXISTS audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    actor TEXT NOT NULL,             -- ใคร (owner:abcd1234 / paypal-webhook / system)
+    action TEXT NOT NULL,            -- เช่น TASK_CREATED / SETTLE_INTENT / WEBHOOK_SIG_FAILED
+    target_type TEXT DEFAULT '',     -- task / dispute / op / webhook_event
+    target_id TEXT DEFAULT '',
+    outcome TEXT NOT NULL,           -- ok / refused / failed / duplicate-ignored ...
+    correlation_id TEXT DEFAULT '',  -- idempotency key / event_id / task id
+    details TEXT DEFAULT '{}',       -- JSON ที่ scrub แล้ว — ห้ามมี secret
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_audit_target ON audit_log(target_type, target_id);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_log(action);
+"""
+
 # คอลัมน์ที่เพิ่มหลัง schema แรก — migrate ให้ DB เก่าอัตโนมัติ
 _MIGRATIONS = (
     ("worker_email_locked", "INTEGER DEFAULT 0"),
@@ -185,6 +220,8 @@ class TaskStore:
             c.executescript(PAYOUT_ITEMS_SCHEMA)
             c.executescript(DISPUTES_SCHEMA)
             c.executescript(LEDGER_SCHEMA)
+            c.executescript(WEBHOOK_EVENTS_SCHEMA)
+            c.executescript(AUDIT_LOG_SCHEMA)
             cols = {r[1] for r in c.execute("PRAGMA table_info(tasks)").fetchall()}
             for name, ddl in _MIGRATIONS:
                 if name not in cols:
@@ -501,3 +538,154 @@ class TaskStore:
                 (task_id, event, ref),
             ).fetchone()
         return row is not None
+
+    # ---------- B5: webhook event dedup ----------
+
+    def webhook_event_get(self, event_id):
+        """ดึง event ตาม PayPal event_id — ไม่มี -> None."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM webhook_events WHERE event_id = ?",
+                (event_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def webhook_event_insert_or_ignore(self, event_id, event_type,
+                                       resource_id="", task_id=None,
+                                       body_hash=""):
+        """INSERT event ใหม่; ถ้า event_id ซ้ำ -> คืน False (dedup).
+
+        เรียกหลัง verify ลายเซ็นผ่านเท่านั้น — ห้าม insert ของที่ยังไม่ verify.
+        """
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT OR IGNORE INTO webhook_events
+                   (event_id, event_type, resource_id, task_id, status,
+                    body_hash, received_at)
+                   VALUES (?, ?, ?, ?, 'RECEIVED', ?, ?)""",
+                (event_id, event_type, resource_id or "",
+                 task_id, body_hash or "", utcnow()),
+            )
+            return cur.rowcount == 1
+
+    def webhook_event_claim(self, event_id):
+        """อ้างสิทธิ์ประมวลผลแบบ atomic — เจ้าของเดียวเท่านั้นได้ไป.
+
+        UPDATE ... WHERE status IN (RECEIVED/FAILED/PROCESSING):
+        rowcount == 1 แปลว่าเราได้สิทธิ์; == 0 แปลว่ามีคนประมวลอยู่แล้ว
+        หรือประมวลเสร็จแล้ว (caller ต้องเช็ค status เอง).
+        """
+        with self._conn() as c:
+            cur = c.execute(
+                """UPDATE webhook_events SET status = 'PROCESSING'
+                   WHERE event_id = ?
+                   AND status IN ('RECEIVED', 'FAILED', 'PROCESSING')""",
+                (event_id,),
+            )
+            return cur.rowcount == 1
+
+    def webhook_event_mark(self, event_id, status, result=""):
+        """จบการประมวล: PROCESSED หรือ FAILED พร้อมสรุปผล."""
+        if status not in ("PROCESSED", "FAILED"):
+            raise ValueError(f"bad webhook event status: {status}")
+        with self._conn() as c:
+            c.execute(
+                """UPDATE webhook_events
+                   SET status = ?, result = ?, processed_at = ?
+                   WHERE event_id = ?""",
+                (status, (result or "")[:500], utcnow(), event_id),
+            )
+
+    def webhook_event_set_task(self, event_id, task_id):
+        """ผูก event กับ task หลัง route สำเร็จ (lookup/report เท่านั้น)."""
+        with self._conn() as c:
+            c.execute(
+                "UPDATE webhook_events SET task_id = ? WHERE event_id = ?",
+                (task_id, event_id),
+            )
+
+    # ---------- B5: append-only audit log ----------
+
+    def audit_append(self, actor, action, target_type="", target_id="",
+                     outcome="ok", correlation_id="", details="{}"):
+        """เขียน audit หนึ่งแถว — append-only ไม่มี update/delete.
+
+        ล้มเหลว -> exception หลุดออกไป (audit.py แปลงเป็น AuditError).
+        """
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO audit_log
+                   (actor, action, target_type, target_id, outcome,
+                    correlation_id, details, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (actor, action, target_type or "", str(target_id or ""),
+                 outcome, correlation_id or "", details or "{}", utcnow()),
+            )
+            return cur.lastrowid
+
+    def audit_list(self, target_type=None, target_id=None, limit=200):
+        """ดึง audit ย้อนหลัง — กรองตาม target ได้."""
+        q = "SELECT * FROM audit_log"
+        args = []
+        conds = []
+        if target_type:
+            conds.append("target_type = ?")
+            args.append(target_type)
+        if target_id is not None:
+            conds.append("target_id = ?")
+            args.append(str(target_id))
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY id DESC LIMIT ?"
+        args.append(limit)
+        with self._conn() as c:
+            rows = c.execute(q, args).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------- B5: resource -> task lookups (สำหรับ webhook routing) ----------
+
+    def find_task_by_capture_id(self, capture_id):
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM tasks WHERE capture_id = ? LIMIT 1",
+                (capture_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def find_task_by_authorization_id(self, authorization_id):
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM tasks WHERE authorization_id = ? LIMIT 1",
+                (authorization_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def find_operation_by_paypal_ref(self, paypal_ref):
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM operations WHERE paypal_ref = ? "
+                "ORDER BY id DESC LIMIT 1",
+                (paypal_ref,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def find_task_by_payout_item_id(self, payout_item_id):
+        with self._conn() as c:
+            row = c.execute(
+                """SELECT t.* FROM tasks t
+                   JOIN payout_items pi ON pi.task_id = t.id
+                   WHERE pi.payout_item_id = ? LIMIT 1""",
+                (payout_item_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_payout_item_status(self, payout_item_id, item_status,
+                                  paypal_status):
+        """อัปเดตสถานะ item จาก webhook — ไม่สร้าง payout ใหม่ ไม่แตะเงิน."""
+        with self._conn() as c:
+            c.execute(
+                """UPDATE payout_items
+                   SET item_status = ?, paypal_status = ?, updated_at = ?
+                   WHERE payout_item_id = ?""",
+                (item_status, paypal_status, utcnow(), payout_item_id),
+            )

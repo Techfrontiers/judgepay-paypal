@@ -728,3 +728,48 @@ class PayPalClient:
         body = r.json()
         return {"payout_item_id": payout_item_id,
                 "transaction_status": body.get("transaction_status", "CANCELED")}
+
+    # ---------- B5: webhook signature verification ----------
+
+    def verify_webhook_signature(self, *, auth_algo, cert_url,
+                                 transmission_id, transmission_sig,
+                                 transmission_time, webhook_id,
+                                 webhook_event):
+        """ตรวจลายเซ็น webhook ผ่าน PayPal postback API (B5).
+
+        POST /v1/notifications/verify-webhook-signature — ส่ง transmission
+        headers + webhook_id + event body ดิบ; PayPal ตอบ verification_status.
+        คืน True ก็ต่อเมื่อ verification_status == "SUCCESS" เท่านั้น.
+
+        กฎ:
+        - ห้ามเชื่อ body/headers ที่เข้ามาโดยไม่ผ่านฟังก์ชันนี้ก่อน
+        - mock mode: จำลองผ่าน PAYPAL_MOCK_WEBHOOK_VERIFY=valid|invalid|missing
+          (แยกชัดว่าไม่ใช่พฤติกรรม PayPal จริง)
+        - real mode ไม่มี webhook_id -> PayPalError (config ผิด = fail-closed)
+        - network/timeout -> PayPalError (caller ต้องถือว่า transient -> retry)
+        """
+        if self.mock:
+            mode = os.getenv("PAYPAL_MOCK_WEBHOOK_VERIFY", "valid").lower()
+            if mode == "valid":
+                return True
+            if mode == "invalid":
+                return False
+            raise PayPalError(
+                "mock webhook verification unavailable "
+                "(PAYPAL_MOCK_WEBHOOK_VERIFY=missing)")
+        if not webhook_id:
+            raise PayPalError(
+                "PAYPAL_WEBHOOK_ID not configured — cannot verify webhook "
+                "signature (fail-closed)")
+        payload = {
+            "auth_algo": auth_algo,
+            "cert_url": cert_url,
+            "transmission_id": transmission_id,
+            "transmission_sig": transmission_sig,
+            "transmission_time": transmission_time,
+            "webhook_id": webhook_id,
+            "webhook_event": webhook_event,
+        }
+        resp = self._post("/v1/notifications/verify-webhook-signature",
+                          payload)
+        return (resp.get("verification_status") or "").upper() == "SUCCESS"
