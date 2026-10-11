@@ -23,8 +23,11 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import time
 from datetime import datetime, timedelta, timezone
+
+import requests
 
 from .store import TaskStore, utcnow
 from .paypal_client import PayPalClient, PayPalError
@@ -37,6 +40,60 @@ from .policy import (
 MAX_OUTPUT_LEN = 20000
 # อายุ confirmation token (วินาที)
 CONFIRM_TOKEN_TTL = 1800
+
+
+def _op_key(task_id, op_type):
+    """Idempotency key ที่เสถียร — derive จาก task + op_type เท่านั้น.
+
+    ห้ามสุ่มใหม่ตอน retry: PayPal ใช้ key นี้กันทำซ้ำ (capture: PayPal-Request-Id,
+    payout: sender_batch_id จำ 30 วัน).
+    """
+    return f"judgepay-{task_id}-{op_type}"
+
+
+def _request_hash(op_type, amount, currency, recipient=""):
+    """ลายนิ้วมือของธุรกรรม — จับได้ถ้า key เดิมถูกเอาไปใช้กับธุรกรรมอื่น."""
+    raw = f"{op_type}|{float(amount):.2f}|{(currency or '').upper()}|{recipient or ''}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _is_definite_failure(exc):
+    """แยก 'ล้มเหลวแน่ๆ' ออกจาก 'ผลคลุมเครือ'.
+
+    definite (retry ด้วย key เดิมได้): HTTP 400/404/422 ที่ไม่ใช่ duplicate
+    ambiguous (ห้ามสรุปว่าล้มเหลว): timeout, connection error, 5xx,
+        409/DUPLICATE (key นี้อาจสำเร็จไปแล้ว — ต้องไปถาม PayPal ก่อน)
+    default: ambiguous — ระวังไว้ก่อนเสมอ. timeout ห้าม mark FAILED เด็ดขาด.
+    """
+    msg = str(exc)
+    if "DUPLICATE" in msg.upper():
+        return False
+    m = re.search(r"-> (\d{3})", msg)
+    if m:
+        code = int(m.group(1))
+        if code in (400, 404, 422):
+            return True
+        return False
+    return False
+
+
+def _extract_ref(op_type, result):
+    """ดึง paypal ref จากผลลัพธ์ — เก็บลง op row ไว้ adopt ทีหลัง."""
+    if op_type == "capture":
+        return result.get("capture_id", "")
+    if op_type == "payout":
+        return result.get("batch_id", "")
+    return ""  # void ไม่มี ref ใหม่
+
+
+def _ref_result(op_type, op):
+    """สร้างผลลัพธ์จาก op ที่เคย SUCCEEDED — คืนของเดิม ไม่ยิงใหม่."""
+    ref = op.get("paypal_ref") or ""
+    if op_type == "capture":
+        return {"capture_id": ref, "status": "COMPLETED"}
+    if op_type == "payout":
+        return {"batch_id": ref, "status": "UNKNOWN"}
+    return {"authorization_id": "", "status": "VOIDED"}
 
 
 class EscrowError(Exception):
@@ -64,16 +121,25 @@ class EscrowService:
             raise EscrowError("amount must be > 0")
         if not description or not description.strip():
             raise EscrowError("description is required")
-        order = self.paypal.create_order(
-            amount=amount,
-            currency=currency,
-            description=f"JudgePay escrow: {description[:80]}",
-        )
         deadline_at = (datetime.now(timezone.utc)
                        + timedelta(hours=deadline_hours)).isoformat()
         criteria_json = json.dumps(acceptance_criteria or [], ensure_ascii=False)
+        # B1: สร้าง task row ก่อนเพื่อให้ได้ task_id -> เอาไปเป็น reference_id
+        # ที่เสถียรของ PayPal order (traceability; order ไม่ขยับเงินเลย retry
+        # ปลอดภัยอยู่แล้ว)
         task = self.store.create_task(description, amount, currency, deadline_at,
                                       requester_email, owner_id, criteria_json)
+        try:
+            order = self.paypal.create_order(
+                amount=amount,
+                currency=currency,
+                description=f"JudgePay escrow: {description[:80]}",
+                reference_id=f"judgepay-{task['id']}-order",
+            )
+        except Exception as e:
+            # order สร้างไม่สำเร็จ — task ค้าง AWAITING_APPROVAL แบบไม่มี order_id
+            # (ซื่อสัตย์กว่าลบทิ้ง: ให้เห็นว่าพังตรงไหน)
+            raise EscrowError(f"PayPal order creation failed: {e}")
         task = self.store.update_task(task["id"], order_id=order["order_id"])
         return {
             "success": True,
@@ -283,19 +349,24 @@ class EscrowService:
         # recipient ที่ใช้ต้องมาจาก DB ที่ล็อกไว้เท่านั้น ห้ามรับจาก client
 
     def _settle_approve(self, task_id, task):
-        """ปล่อยเงิน: capture ก่อน แล้ว payout. ผลคลุมเครือ -> NEEDS_RECONCILIATION."""
+        """ปล่อยเงิน: capture ก่อน แล้ว payout — ผ่าน _execute_op (idempotent).
+
+        ผลคลุมเครือ -> NEEDS_RECONCILIATION + op ถูกบันทึกไว้ reconcile ทีหลัง.
+        ห้ามยิงซ้ำด้วย key ใหม่เด็ดขาด.
+        """
         auth_id = task["authorization_id"]
         recipient = task["worker_email"]  # มาจาก DB ที่ล็อกไว้เท่านั้น
         try:
-            cap = self.paypal.capture_authorization(auth_id)
-        except Exception as e:
+            cap = self._execute_op(task, "capture")
+        except EscrowError:
             self.store.update_task(task_id, status="NEEDS_RECONCILIATION",
                                    last_paypal_op=f"capture:{auth_id}")
-            raise EscrowError(f"capture failed or ambiguous -> NEEDS_RECONCILIATION: {e}")
+            raise
         try:
             task = self.store.update_task(task_id, capture_id=cap["capture_id"])
         except Exception as e:
-            # capture อาจสำเร็จแล้วแต่ DB เขียนไม่ติด — ห้ามยิง capture ซ้ำ
+            # capture สำเร็จแล้ว (op SUCCEEDED + paypal_ref ครบ) แต่เขียน task ไม่ติด —
+            # reconcile จะ adopt จาก op ได้ ห้ามยิง capture ซ้ำ
             self.store.update_task(task_id, capture_id=cap["capture_id"],
                                    status="NEEDS_RECONCILIATION",
                                    last_paypal_op=f"capture:{auth_id}")
@@ -304,14 +375,11 @@ class EscrowService:
                 f"NEEDS_RECONCILIATION (do NOT retry capture): {e}"
             )
         try:
-            payout = self.paypal.payout_to_worker(
-                recipient, task["amount"], task["currency"],
-                note=f"JudgePay task-{task_id} human-approved (score {task['judge_score']})",
-            )
-        except Exception as e:
+            payout = self._execute_op(task, "payout")
+        except EscrowError:
             self.store.update_task(task_id, status="NEEDS_RECONCILIATION",
                                    last_paypal_op=f"payout:{cap['capture_id']}")
-            raise EscrowError(f"payout failed or ambiguous -> NEEDS_RECONCILIATION: {e}")
+            raise
         self.store.update_task(task_id, payout_batch_id=payout.get("batch_id"))
         if payout.get("status") != "SUCCESS":
             # payout ยังไม่สำเร็จ (PENDING/UNCLAIMED/DENIED) — ห้าม mark COMPLETED
@@ -333,14 +401,14 @@ class EscrowService:
         }
 
     def _settle_reject(self, task_id, verdict):
-        # งานไม่ผ่าน: void — เงินไม่ขยับ คืน hold ให้ requester
+        # งานไม่ผ่าน: void — เงินไม่ขยับ คืน hold ให้ requester (idempotent)
         task = self._require(task_id)
         try:
-            void = self.paypal.void_authorization(task["authorization_id"])
-        except Exception as e:
+            void = self._execute_op(task, "void")
+        except EscrowError:
             self.store.update_task(task_id, status="NEEDS_RECONCILIATION",
                                    last_paypal_op=f"void:{task['authorization_id']}")
-            raise EscrowError(f"void failed or ambiguous -> NEEDS_RECONCILIATION: {e}")
+            raise
         self.store.update_task(task_id, status="REFUNDED")
         return {
             "success": True, "task_id": task_id,
@@ -348,6 +416,109 @@ class EscrowService:
             "reasoning": verdict["reasoning"],
             "void_status": void["status"], "status": "REFUNDED",
         }
+
+    # ---------- B1: idempotent operation executor ----------
+
+    def _execute_op(self, task, op_type, reconcile_mode=False):
+        """รัน PayPal operation แบบ idempotent — หัวใจของ B1.
+
+        1. record_intent ลง DB ก่อนยิงเสมอ (crash-safe; key ซ้ำ -> ใช้ row เดิม)
+        2. ตรวจ request_hash — key เดิมแต่ธุรกรรมเปลี่ยน -> ปฏิเสธเสียงดัง
+        3. SUCCEEDED -> คืนผลเดิม ไม่ยิง PayPal ซ้ำ
+           SENT / NEEDS_RECONCILIATION -> ยิงซ้ำได้เฉพาะ reconcile_mode
+               (replay ด้วย key เดิม = PayPal คืนผลเดิม ไม่ทำซ้ำ)
+           FAILED (ล้มเหลวชัดเจน) -> retry ได้ด้วย key เดิม
+        4. mark SENT ก่อนยิง; จบแล้ว mark SUCCEEDED / FAILED /
+           NEEDS_RECONCILIATION
+           - timeout / connection / 5xx / duplicate-indicator -> NEEDS_RECONCILIATION
+             (ห้าม mark FAILED เด็ดขาด — timeout ไม่ใช่หลักฐานว่าล้มเหลว)
+           - 400/404/422 ชัดเจน (ไม่ใช่ duplicate) -> FAILED
+        """
+        task_id = task["id"]
+        key = _op_key(task_id, op_type)
+        req_hash = _request_hash(op_type, task["amount"], task["currency"],
+                                 task.get("worker_email") or "")
+        op = self.store.record_intent(
+            task_id, op_type, key, req_hash,
+            amount=task["amount"], currency=task["currency"],
+            recipient=task.get("worker_email") or "",
+        )
+        if op["request_hash"] != req_hash:
+            raise EscrowError(
+                f"idempotency key {key} ถูกใช้กับธุรกรรมอื่นแล้ว "
+                f"(amount/currency/recipient ไม่ตรง intent เดิม) — ปฏิเสธ"
+            )
+        st = op["status"]
+        if st == "SUCCEEDED":
+            # เคยสำเร็จแล้ว — คืนผลเดิม ไม่ยิง PayPal ซ้ำ
+            if op_type == "payout" and op.get("paypal_ref"):
+                # batch status อาจเปลี่ยน (PENDING -> SUCCESS) — ถามของเดิม
+                try:
+                    b = self.paypal.get_payout_batch(op["paypal_ref"])
+                    return {"replayed": True, "batch_id": op["paypal_ref"],
+                            "status": b.get("status")}
+                except PayPalError:
+                    pass
+            return {"replayed": True, **_ref_result(op_type, op)}
+        if st == "NEEDS_RECONCILIATION" and not reconcile_mode:
+            raise EscrowError(
+                f"operation {op_type} อยู่ในสถานะ NEEDS_RECONCILIATION — "
+                f"ต้อง reconcile ก่อน retry"
+            )
+        # SENT: อาจมีอีก thread/process กำลังยิงอยู่ หรือ crash ค้างไว้ —
+        # replay ด้วย key เดิมปลอดภัยเสมอ (PayPal คืนผลเดิม ไม่ทำซ้ำ)
+        if st != "SENT":
+            # INTENDED / FAILED / NEEDS_RECONCILIATION(reconcile) -> SENT
+            # (SENT อยู่แล้วไม่ต้อง mark ซ้ำ — replay ปลอดภัย)
+            self.store.transition_operation(key, "SENT")
+        send = self._sender_for(task, op)
+        try:
+            result = send(key, op)
+        except (requests.Timeout, requests.ConnectionError) as e:
+            self.store.transition_operation(key, "NEEDS_RECONCILIATION")
+            raise EscrowError(
+                f"{op_type}: timeout/connection ผลไม่ชัด "
+                f"-> NEEDS_RECONCILIATION: {e}")
+        except PayPalError as e:
+            if _is_definite_failure(e):
+                self.store.transition_operation(key, "FAILED")
+                raise EscrowError(f"{op_type}: ล้มเหลวชัดเจน -> FAILED: {e}")
+            self.store.transition_operation(key, "NEEDS_RECONCILIATION")
+            raise EscrowError(f"{op_type}: ผลคลุมเครือ -> NEEDS_RECONCILIATION: {e}")
+        except Exception as e:
+            # error อื่น (รวม bug) — ระวังไว้ก่อน ไม่ mark FAILED
+            self.store.transition_operation(key, "NEEDS_RECONCILIATION")
+            raise EscrowError(
+                f"{op_type}: error ไม่คาดคิด -> NEEDS_RECONCILIATION: {e}")
+        ref = _extract_ref(op_type, result)
+        self.store.transition_operation(key, "SUCCEEDED", paypal_ref=ref)
+        return result
+
+    def _sender_for(self, task, op):
+        """สร้าง send closure ของแต่ละ op_type — ใช้ค่าตอน intent (กัน task เปลี่ยน)."""
+        op_type = op["op_type"]
+        if op_type == "capture":
+            auth_id = task["authorization_id"]
+            return lambda key, _op: self.paypal.capture_authorization(
+                auth_id, idempotency_key=key)
+        if op_type == "payout":
+            recipient = op["recipient"] or task.get("worker_email")
+            amount = op["amount"] if op["amount"] is not None else task["amount"]
+            currency = op["currency"] or task["currency"]
+            note = (f"JudgePay task-{task['id']} human-approved "
+                    f"(score {task.get('judge_score')})")
+            return lambda key, _op: self.paypal.payout_to_worker(
+                recipient, amount, currency, note=note,
+                sender_batch_id=key, sender_item_id=f"{key}-item1")
+        if op_type == "void":
+            auth_id = task["authorization_id"]
+            return lambda key, _op: self.paypal.void_authorization(
+                auth_id, idempotency_key=key)
+        raise EscrowError(f"unknown op_type: {op_type}")
+
+    def _reconcile_op(self, task, op):
+        """replay op ที่ค้างด้วย key เดิม — ปลอดภัย ไม่ทำซ้ำ."""
+        return self._execute_op(task, op["op_type"], reconcile_mode=True)
 
     # ---------- 5. หมดเวลา ----------
 
@@ -357,8 +528,8 @@ class EscrowService:
             raise EscrowError(f"task {task_id} already {task['status']}")
         if task["status"] == "OPEN" and task["authorization_id"]:
             try:
-                self.paypal.void_authorization(task["authorization_id"])
-            except PayPalError as e:
+                self._execute_op(task, "void")
+            except EscrowError as e:
                 raise EscrowError(f"void failed: {e}")
         self.store.update_task(task_id, status="EXPIRED")
         return {"success": True, "task_id": task_id, "status": "EXPIRED"}
@@ -368,13 +539,37 @@ class EscrowService:
     def reconcile(self, task_id):
         """อ่านความจริงจาก PayPal แล้วปรับ DB ให้ตรง.
 
-        กฎ:
+        B1: ไล่ operations ที่ค้างก่อน (INTENDED/SENT/NEEDS_RECONCILIATION) —
+        replay ด้วย key เดิม (ปลอดภัย ไม่ทำซ้ำ) แล้วค่อยปรับ task status.
+        กฎ task-level เดิมยังคง:
         - capture อยู่ใน DB + payout batch SUCCESS -> COMPLETED
         - authorization ถูก VOIDED และไม่มี capture -> REFUNDED
         - นอกนั้นคง NEEDS_RECONCILIATION ไว้ให้คนตัดสินใจ (ไม่เดา)
         """
         task = self._require(task_id)
         actions = []
+        # 1. B1: ซ่อม operations ที่ค้างก่อน — ใช้ key เดิม replay
+        for op in self.store.list_operations(task_id):
+            if op["status"] in ("INTENDED", "SENT", "NEEDS_RECONCILIATION"):
+                try:
+                    self._reconcile_op(task, op)
+                    new = self.store.get_operation(op["idempotency_key"])
+                    actions.append(
+                        f"op {op['op_type']}: {op['status']} -> {new['status']}")
+                except EscrowError as e:
+                    actions.append(f"op {op['op_type']} unresolved: {e}")
+                task = self._require(task_id)  # refresh หลัง op อาจเปลี่ยน task
+        # 2. backfill refs จาก ops (crash ระหว่าง op สำเร็จกับ update task)
+        ops = {o["op_type"]: o for o in self.store.list_operations(task_id)}
+        updates = {}
+        if not task.get("capture_id") and (ops.get("capture") or {}).get("paypal_ref"):
+            updates["capture_id"] = ops["capture"]["paypal_ref"]
+        if not task.get("payout_batch_id") and (ops.get("payout") or {}).get("paypal_ref"):
+            updates["payout_batch_id"] = ops["payout"]["paypal_ref"]
+        if updates:
+            task = self.store.update_task(task_id, **updates)
+            actions.append(f"backfilled task refs from ops: {sorted(updates)}")
+        # 3. task-level truth จาก PayPal
         auth = batch = None
         if task.get("authorization_id"):
             try:
@@ -400,6 +595,25 @@ class EscrowService:
             actions.append(f"status unchanged: {task['status']} (needs human decision)")
         return {"success": True, "task_id": task_id,
                 "status": new_status, "actions": actions}
+
+    def reconcile_all(self):
+        """ไล่ทุก operation ที่ค้างทั่ว DB — ใช้ตอน start / cron / หลัง restart."""
+        results = []
+        for op in self.store.list_open_operations():
+            task = self.store.get_task(op["task_id"])
+            if not task:
+                results.append({"task_id": op["task_id"], "op": op["op_type"],
+                                "status": "skipped", "note": "task not found"})
+                continue
+            try:
+                self._reconcile_op(task, op)
+                new = self.store.get_operation(op["idempotency_key"])
+                results.append({"task_id": op["task_id"], "op": op["op_type"],
+                                "status": new["status"]})
+            except EscrowError as e:
+                results.append({"task_id": op["task_id"], "op": op["op_type"],
+                                "status": "unresolved", "error": str(e)})
+        return {"success": True, "results": results}
 
     # ---------- helpers ----------
 

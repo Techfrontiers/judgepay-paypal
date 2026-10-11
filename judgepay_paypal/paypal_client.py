@@ -4,9 +4,26 @@
 (authorize/capture/void) -> Payouts v1 (จ่าย worker)
 Mock: ถ้า PAYPAL_MOCK=true หรือไม่มี credentials จะคืน fake ID ที่สมจริง
 และจำลอง state machine ให้โฟลว์ทั้งหมดรันออฟไลน์ได้
+
+ข้อเท็จจริงจาก PayPal docs (ฝังไว้กันลืม — แยกจากข้อสมมติ):
+- PayPal-Request-Id (REST POST): server จำ ID ไว้; retry ด้วย ID เดิม
+  จะคืนสถานะล่าสุดของ request เดิม ไม่ทำ action ซ้ำ. ใช้ retry ตอน
+  network timeout / HTTP 5xx. (Payouts doc: จำ key ไว้ 30 วัน)
+- Payouts sender_batch_id: "PayPal does not process duplicate payouts.
+  ถ้าส่ง sender_batch_id ที่ใช้ไปแล้วใน 30 วัน API จะ REJECT พร้อม error
+  ที่บอก sender_batch_id เดิม + HATEOAS link ไป payout ต้นฉบับ."
+  เจอ HTTP 5xx ให้ retry ด้วย sender_batch_id เดิมได้อย่างปลอดภัย.
+- sender_item_id ซ้ำใน 30 วัน -> item นั้นไม่ถูกประมวลผล (batch DUPLICATE).
+- 409 DUPLICATE_TRANSACTION = key นี้สำเร็จไปแล้ว -> ไปดึง resource เดิม
+  อย่าส่งใหม่.
+- ข้อสมมติ (อย่าพึ่งพา): ระยะเวลาเก็บ PayPal-Request-Id ของ Payments v2
+  (authorize/capture/void) doc บอกแค่ "a period of time" — โค้ดห้ามพึ่งว่า
+  จำตลอดไป; operations log ใน DB คือ durable source of truth ของเรา.
 """
 
 import os
+import re
+import threading
 import time
 import uuid
 import random
@@ -25,6 +42,18 @@ def _fake_id(prefix_chars="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789", n=17):
 
 class PayPalError(Exception):
     pass
+
+
+def _parse_duplicate_payout_link(err_text):
+    """หา HATEOAS link ของ original payout จาก error text.
+
+    PayPal จะ reject sender_batch_id ซ้ำพร้อม link ไป batch ต้นฉบับ —
+    คืน payout_batch_id หรือ None ถ้าไม่ใช่ duplicate error.
+    """
+    if "DUPLICATE" not in err_text.upper():
+        return None
+    m = re.search(r"/v1/payments/payouts/([A-Za-z0-9_-]+)", err_text)
+    return m.group(1) if m else None
 
 
 class PayPalClient:
@@ -59,6 +88,14 @@ class PayPalClient:
         self._auths = {}
         self._captures = {}
         self._payouts = {}
+        # B1: mock จำลอง idempotency ของ PayPal (key -> ผลลัพธ์) — persist ด้วย
+        self._idem_capture = {}
+        self._payout_idem = {}
+        self._void_idem = {}
+        # lock กัน race ใน mock (จำลอง server-side idempotency ของ PayPal)
+        self._mock_lock = threading.Lock()
+        # ตัวนับ "ยิงจริง" (ไม่นับ replay) — ไว้ assert ในเทส
+        self._mock_calls = {"capture_exec": 0, "payout_exec": 0, "void_exec": 0}
         if self.mock:
             self._load_mock()
 
@@ -73,6 +110,9 @@ class PayPalClient:
             self._auths = data.get("auths", {})
             self._captures = data.get("captures", {})
             self._payouts = data.get("payouts", {})
+            self._idem_capture = data.get("idem_capture", {})
+            self._payout_idem = data.get("payout_idem", {})
+            self._void_idem = data.get("void_idem", {})
         except (FileNotFoundError, ValueError):
             pass
 
@@ -83,6 +123,9 @@ class PayPalClient:
             json.dump({
                 "orders": self._orders, "auths": self._auths,
                 "captures": self._captures, "payouts": self._payouts,
+                "idem_capture": self._idem_capture,
+                "payout_idem": self._payout_idem,
+                "void_idem": self._void_idem,
             }, f)
 
     # ---------- auth ----------
@@ -206,44 +249,90 @@ class PayPalClient:
         return {"authorization_id": res["id"], "status": res.get("status"),
                 "amount": amt.get("value"), "currency": amt.get("currency_code")}
 
-    def capture_authorization(self, auth_id, amount=None, currency="USD"):
-        """ปล่อยเงิน (approve) — final_capture=true, ใส่ PayPal-Request-Id กันยิงซ้ำ."""
+    def capture_authorization(self, auth_id, amount=None, currency="USD",
+                              idempotency_key=None):
+        """ปล่อยเงิน (approve) — final_capture=true.
+
+        B1: ส่ง PayPal-Request-Id ที่เสถียร (derive จาก task) — retry ด้วย key
+        เดิม PayPal จะคืนผลเดิม ไม่ capture ซ้ำ. ถ้าไม่ส่ง key มา จะสุ่มให้
+        (ใช้ได้เฉพาะ caller ที่ยิงครั้งเดียว ไม่ retry).
+        """
+        fail_mode = os.getenv("PAYPAL_MOCK_FAIL_MODE", "")
         if self.mock:
-            a = self._auths.get(auth_id)
-            if not a:
-                raise PayPalError(f"mock: unknown authorization {auth_id}")
-            if a["status"] != "AUTHORIZED":
-                raise PayPalError(f"mock: cannot capture authorization in status {a['status']}")
-            a["status"] = "CAPTURED"
-            cap_id = _fake_id()
-            self._captures[cap_id] = {
-                "status": "COMPLETED",
-                "amount": a["amount"],
-                "currency": a["currency"],
-            }
-            self._save_mock()
-            return {"capture_id": cap_id, "status": "COMPLETED"}
+            key = idempotency_key or f"mock-{uuid.uuid4().hex}"
+            with self._mock_lock:
+                # replay ด้วย key เดิม -> คืนผลเดิมทันที ไม่ทำซ้ำ
+                if key in self._idem_capture:
+                    return dict(self._idem_capture[key])
+                a = self._auths.get(auth_id)
+                if not a:
+                    raise PayPalError(f"mock: unknown authorization {auth_id}")
+                if a["status"] != "AUTHORIZED":
+                    raise PayPalError(
+                        f"mock: cannot capture authorization in status {a['status']}")
+                if fail_mode == "error_500_capture":
+                    raise PayPalError(
+                        "POST /v2/payments/authorizations/x/capture -> 500: "
+                        "INTERNAL_SERVER_ERROR")
+                if fail_mode == "error_422_capture":
+                    raise PayPalError(
+                        "POST /v2/payments/authorizations/x/capture -> 422: "
+                        "UNPROCESSABLE_ENTITY: authorization already completed")
+                a["status"] = "CAPTURED"
+                cap_id = _fake_id()
+                self._captures[cap_id] = {
+                    "status": "COMPLETED",
+                    "amount": a["amount"],
+                    "currency": a["currency"],
+                }
+                result = {"capture_id": cap_id, "status": "COMPLETED"}
+                self._idem_capture[key] = result
+                self._save_mock()
+                self._mock_calls["capture_exec"] += 1
+                if fail_mode == "timeout_after_capture":
+                    # ฝั่ง server สำเร็จแล้ว แต่ client เจอ timeout (จำลองของจริง)
+                    raise requests.Timeout("mock: timeout after capture succeeded")
+                return result
+        key = idempotency_key or str(uuid.uuid4())
+        if idempotency_key is None:
+            # เตือน: ไม่มี key = retry ไม่ปลอดภัย (caller นี้ต้องยิงครั้งเดียว)
+            import logging
+            logging.getLogger(__name__).warning(
+                "capture_authorization without idempotency_key — retry is unsafe")
         payload = {"final_capture": True}
         if amount is not None:
             payload["amount"] = {"currency_code": currency, "value": f"{amount:.2f}"}
         res = self._post(
             f"/v2/payments/authorizations/{auth_id}/capture",
             payload,
-            extra_headers={"PayPal-Request-Id": str(uuid.uuid4())},
+            extra_headers={"PayPal-Request-Id": key},
         )
         return {"capture_id": res["id"], "status": res.get("status")}
 
-    def void_authorization(self, auth_id):
-        """ยกเลิก hold — เงินไม่ขยับ (reject / expire path)."""
+    def void_authorization(self, auth_id, idempotency_key=None):
+        """ยกเลิก hold — เงินไม่ขยับ (reject / expire path).
+
+        B1: รับ idempotency_key ไว้ (mock จำผลตาม key; ของจริง void เรียกซ้ำ
+        ด้วย key เดิมได้โดยไม่ void ซ้ำ — 204 คือสำเร็จอยู่แล้วเลย idempotent
+        ตามธรรมชาติ).
+        """
         if self.mock:
-            a = self._auths.get(auth_id)
-            if not a:
-                raise PayPalError(f"mock: unknown authorization {auth_id}")
-            if a["status"] not in ("AUTHORIZED",):
-                raise PayPalError(f"mock: cannot void authorization in status {a['status']}")
-            a["status"] = "VOIDED"
-            self._save_mock()
-            return {"authorization_id": auth_id, "status": "VOIDED"}
+            key = idempotency_key or f"mock-{uuid.uuid4().hex}"
+            with self._mock_lock:
+                if key in self._void_idem:
+                    return dict(self._void_idem[key])
+                a = self._auths.get(auth_id)
+                if not a:
+                    raise PayPalError(f"mock: unknown authorization {auth_id}")
+                if a["status"] not in ("AUTHORIZED",):
+                    raise PayPalError(
+                        f"mock: cannot void authorization in status {a['status']}")
+                a["status"] = "VOIDED"
+                result = {"authorization_id": auth_id, "status": "VOIDED"}
+                self._void_idem[key] = result
+                self._save_mock()
+                self._mock_calls["void_exec"] += 1
+                return result
         # PayPal ตอบ 204 No Content = void สำเร็จ (ไม่มี body) — ห้าม treat เป็น error
         r = requests.post(
             f"{self.base}/v2/payments/authorizations/{auth_id}/void",
@@ -260,21 +349,65 @@ class PayPalClient:
 
     # ---------- Payouts v1 ----------
 
-    def payout_to_worker(self, email, amount, currency="USD", note=""):
+    def payout_to_worker(self, email, amount, currency="USD", note="",
+                         sender_batch_id=None, sender_item_id=None):
         """จ่ายเงินให้ worker — async mode (PayPal เลิกให้ใช้ sync_mode กับ integration ใหม่)
-        ส่ง batch แล้ว poll สถานะจนกว่าจะ SUCCESS/FAILED (timeout ~60 วิ)."""
+        ส่ง batch แล้ว poll สถานะจนกว่าจะ SUCCESS/FAILED (timeout ~60 วิ).
+
+        B1: sender_batch_id ต้องเสถียรต่อ logical payout — PayPal ไม่ประมวลผล
+        batch ซ้ำ (30 วัน) ถ้า API reject ว่า duplicate จะตาม HATEOAS link ไปเอา
+        batch ต้นฉบับแทนการยิงใหม่.
+        """
+        key = sender_batch_id or f"judgepay-batch-{uuid.uuid4().hex}"
+        item_key = sender_item_id or f"task-{uuid.uuid4().hex[:8]}"
+        try:
+            return self._payout_send(email, amount, currency, note, key, item_key)
+        except PayPalError as e:
+            orig = _parse_duplicate_payout_link(str(e))
+            if orig:
+                # PayPal บอกว่า sender_batch_id นี้ส่งไปแล้ว — ตาม link ไปเอา
+                # สถานะของเดิม ห้ามยิง batch ใหม่
+                return self.get_payout_batch(orig)
+            raise
+
+    def _payout_send(self, email, amount, currency, note, batch_key, item_key):
+        fail_mode = os.getenv("PAYPAL_MOCK_FAIL_MODE", "")
         if self.mock:
-            batch_id = _fake_id()
-            # test seam: PAYPAL_MOCK_PAYOUT_STATUS=PENDING/UNCLAIMED/DENIED ไว้เทส path ไม่สำเร็จ
-            status = os.getenv("PAYPAL_MOCK_PAYOUT_STATUS", "SUCCESS").upper()
-            self._payouts[batch_id] = {"status": status, "receiver": email,
-                                       "amount": f"{amount:.2f}"}
-            self._save_mock()
-            return {"batch_id": batch_id, "status": status}
-        batch_id = f"judgepay-batch-{uuid.uuid4().hex}"
+            with self._mock_lock:
+                # จำลอง PayPal จริง: sender_batch_id ซ้ำใน 30 วัน -> reject + link
+                if fail_mode == "duplicate_batch" and batch_key in self._payout_idem:
+                    orig = self._payout_idem[batch_key]["batch_id"]
+                    raise PayPalError(
+                        "POST /v1/payments/payouts -> 400: DUPLICATE_SENDER_BATCH_ID: "
+                        f"sender_batch_id {batch_key} already used in the last 30 days; "
+                        "\"links\": [{\"rel\": \"original_payout\", \"href\": "
+                        f"\"https://api-m.sandbox.paypal.com/v1/payments/payouts/{orig}\"}}]"
+                    )
+                # replay ด้วย key เดิม -> คืนผลเดิม ไม่สร้าง batch ใหม่
+                if batch_key in self._payout_idem:
+                    return dict(self._payout_idem[batch_key])
+                if fail_mode == "error_422_payout":
+                    raise PayPalError(
+                        "POST /v1/payments/payouts -> 422: UNPROCESSABLE_ENTITY: "
+                        "receiver invalid")
+                if fail_mode == "error_500_payout":
+                    raise PayPalError(
+                        "POST /v1/payments/payouts -> 500: INTERNAL_SERVER_ERROR")
+                # test seam: PAYPAL_MOCK_PAYOUT_STATUS=PENDING/UNCLAIMED/DENIED ไว้เทส path ไม่สำเร็จ
+                status = os.getenv("PAYPAL_MOCK_PAYOUT_STATUS", "SUCCESS").upper()
+                batch_id = _fake_id()
+                self._payouts[batch_id] = {"status": status, "receiver": email,
+                                           "amount": f"{amount:.2f}"}
+                result = {"batch_id": batch_id, "status": status}
+                self._payout_idem[batch_key] = result
+                self._save_mock()
+                self._mock_calls["payout_exec"] += 1
+                if fail_mode == "timeout_after_payout":
+                    raise requests.Timeout("mock: timeout after payout batch created")
+                return result
         payload = {
             "sender_batch_header": {
-                "sender_batch_id": batch_id,
+                "sender_batch_id": batch_key,
                 "email_subject": "You got paid via JudgePay!",
                 "email_message": "AI judge approved your work. Payment sent.",
             },
@@ -284,7 +417,7 @@ class PayPalClient:
                     "amount": {"value": f"{amount:.2f}", "currency": currency},
                     "receiver": email,
                     "note": (note or "JudgePay approved payout")[:4000],
-                    "sender_item_id": f"task-{uuid.uuid4().hex[:8]}",
+                    "sender_item_id": item_key,
                 }
             ],
         }

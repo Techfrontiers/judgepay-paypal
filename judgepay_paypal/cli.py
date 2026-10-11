@@ -76,7 +76,10 @@ def main():
                    help="required for NEEDS_REVIEW tasks")
 
     p = sub.add_parser("reconcile", help="Reconcile task state with PayPal truth")
-    p.add_argument("task_id", type=int)
+    p.add_argument("task_id", type=int, nargs="?",
+                   help="task id (ไม่ต้องใส่ถ้าใช้ --all)")
+    p.add_argument("--all", action="store_true",
+                   help="reconcile ทุก operation ที่ค้างทั่ว DB (ใช้ตอน start/cron)")
 
     p = sub.add_parser("expire", help="Expire a task")
     p.add_argument("task_id", type=int)
@@ -121,7 +124,12 @@ def main():
             result = svc.settle_approved(args.task_id, token,
                                          human_approve=args.approve_review)
         elif args.command == "reconcile":
-            result = svc.reconcile(args.task_id)
+            if args.all:
+                result = svc.reconcile_all()
+            elif args.task_id is None:
+                result = {"error": "reconcile ต้องระบุ task_id หรือ --all"}
+            else:
+                result = svc.reconcile(args.task_id)
         elif args.command == "expire":
             result = svc.expire_task(args.task_id)
         elif args.command == "list":
