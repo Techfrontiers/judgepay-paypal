@@ -85,6 +85,8 @@ def _extract_ref(op_type, result):
         return result.get("capture_id", "")
     if op_type == "payout":
         return result.get("batch_id", "")
+    if op_type == "refund":
+        return result.get("refund_id", "")
     return ""  # void ไม่มี ref ใหม่
 
 
@@ -95,6 +97,9 @@ def _ref_result(op_type, op):
         return {"capture_id": ref, "status": "COMPLETED"}
     if op_type == "payout":
         return {"batch_id": ref, "status": "UNKNOWN"}
+    if op_type == "refund":
+        # สถานะ refund จริงต้องถาม get_refund — คืน UNKNOWN ให้ caller ไป sync
+        return {"refund_id": ref, "status": "UNKNOWN"}
     return {"authorization_id": "", "status": "VOIDED"}
 
 
@@ -372,6 +377,10 @@ class EscrowService:
 
     def settle_approved(self, task_id, confirmation_token, human_approve=False):
         task = self._require(task_id)
+        # B4: มี dispute ค้าง -> ระงับ settlement จนกว่า resolve (fail-closed)
+        if task["status"] == "DISPUTED":
+            raise EscrowError(
+                "dispute open — settlement suspended until the dispute is resolved")
         if task["status"] == "NEEDS_REVIEW" and not human_approve:
             raise EscrowError("task needs explicit human review decision first")
         if task["status"] not in ("JUDGED", "NEEDS_REVIEW"):
@@ -565,9 +574,348 @@ class EscrowService:
                 "task_status": "NEEDS_RECONCILIATION",
                 "items": items_out, "note": reason, "actions": actions}
 
+    # ---------- B4: dispute / refund lifecycle ----------
+
+    def _check_owner(self, task, owner_id):
+        """B4: dispute/refund เปลี่ยนสถานะเงิน — ต้องเป็นเจ้าของ task เท่านั้น.
+
+        task ที่มี owner_id ผูกไว้: caller ต้องแสดง owner_id ตรงกัน.
+        task เก่าที่ไม่มี owner: อนุญาต (พฤติกรรมเดิมของ escrow methods อื่น).
+        """
+        want = task.get("owner_id") or ""
+        if want and want != (owner_id or ""):
+            raise EscrowError("forbidden: not your task")
+
+    def open_dispute(self, task_id, opened_by, reason, evidence_note="",
+                     owner_id=""):
+        """เปิดข้อพิพาท — task -> DISPUTED, settlement ถูกระงับทันที.
+
+        ใครเปิดก็ได้ (requester/worker/operator) แต่ต้องเป็นเจ้าของ task.
+        AI judge ไม่เกี่ยว — dispute ตัดสินโดยมนุษย์เท่านั้น.
+        """
+        task = self._require(task_id)
+        self._check_owner(task, owner_id)
+        reason = (reason or "").strip()
+        if not reason:
+            raise EscrowError("dispute reason is required")
+        if self.store.get_open_dispute(task_id):
+            raise EscrowError(
+                f"task {task_id} already has an open dispute — "
+                "resolve it before opening another")
+        d = self.store.create_dispute(task_id, (opened_by or "operator").strip(),
+                                      reason)
+        self.store.update_task(task_id, status="DISPUTED",
+                               last_paypal_op=f"dispute:{d['id']}")
+        self.store.ledger_append(
+            task_id, "DISPUTE_OPENED", ref=str(d["id"]),
+            note=f"by {d['opened_by']}: {reason[:200]}")
+        if (evidence_note or "").strip():
+            self.add_dispute_evidence(task_id, d["opened_by"],
+                                      evidence_note.strip(), owner_id=owner_id)
+            d = self.store.get_dispute(task_id)
+        return {"success": True, "task_id": task_id,
+                "dispute_id": d["id"], "dispute_status": d["status"],
+                "task_status": "DISPUTED",
+                "next": "settlement suspended until resolve_dispute"}
+
+    def add_dispute_evidence(self, task_id, by, note, owner_id=""):
+        """แนบหลักฐาน — ได้เฉพาะตอน dispute ยังเปิดอยู่; ตรวจสิทธิ์เจ้าของ."""
+        task = self._require(task_id)
+        self._check_owner(task, owner_id)
+        d = self.store.get_open_dispute(task_id)
+        if not d:
+            raise EscrowError(f"task {task_id} has no open dispute")
+        if not (note or "").strip():
+            raise EscrowError("evidence note is required")
+        try:
+            ev = json.loads(d["evidence"] or "[]")
+            if not isinstance(ev, list):
+                ev = []
+        except (ValueError, TypeError):
+            ev = []
+        ev.append({"by": (by or "").strip() or "unknown",
+                   "note": note.strip()[:2000], "at": utcnow()})
+        fields = {"evidence": json.dumps(ev, ensure_ascii=False)}
+        if d["status"] == "OPEN":
+            fields["status"] = "UNDER_REVIEW"
+        self.store.update_dispute(d["id"], **fields)
+        return {"success": True, "task_id": task_id, "dispute_id": d["id"],
+                "dispute_status": fields.get("status", d["status"]),
+                "evidence_count": len(ev)}
+
+    def resolve_dispute(self, task_id, reviewer, decision, reason="",
+                        owner_id=""):
+        """มนุษย์ตัดสิน dispute — AI เป็นผู้ตัดสินไม่ได้ (ไม่มี judge call ในนี้).
+
+        upheld = ข้อพิพาทมีมูล (เช่น ต้องคืนเงิน) -> task กลับ NEEDS_REVIEW
+        rejected = ข้อพิพาทไม่มีมูล -> task กลับ NEEDS_REVIEW
+        ทั้งสองทางต้องให้คนตัดสินใจขั้นต่อไปเอง — ไม่ auto-settle ไม่ auto-refund.
+        """
+        task = self._require(task_id)
+        self._check_owner(task, owner_id)
+        if decision not in ("upheld", "rejected"):
+            raise EscrowError("decision must be 'upheld' or 'rejected'")
+        reviewer = (reviewer or "").strip()
+        if not reviewer:
+            raise EscrowError("reviewer is required")
+        d = self.store.get_open_dispute(task_id)
+        if not d:
+            raise EscrowError(f"task {task_id} has no open dispute to resolve")
+        new_status = ("RESOLVED_UPHELD" if decision == "upheld"
+                      else "RESOLVED_REJECTED")
+        self.store.update_dispute(
+            d["id"], status=new_status, reviewer=reviewer,
+            decision=decision, decided_at=utcnow())
+        # ออกจาก DISPUTED -> NEEDS_REVIEW ให้คนตัดสินใจขั้นต่อไป (ไม่เดา)
+        self.store.update_task(task_id, status="NEEDS_REVIEW",
+                               last_paypal_op=f"dispute:{d['id']}:{decision}")
+        self.store.ledger_append(
+            task_id, "DISPUTE_CLOSED", ref=str(d["id"]),
+            note=f"{decision} by {reviewer}: {(reason or '').strip()[:200]}")
+        return {"success": True, "task_id": task_id, "dispute_id": d["id"],
+                "decision": decision, "dispute_status": new_status,
+                "task_status": "NEEDS_REVIEW",
+                "next": "human decides next step (settle / refund / close)"}
+
+    def refund_capture(self, task_id, amount=None, reason="", human_confirm=False,
+                       dispute_resolution=False, owner_id=""):
+        """คืนเงินจาก capture — ต้อง human_confirm ชัดแจ้งทุกครั้ง (B4).
+
+        กฎ:
+        - ตรวจ capture จริงจาก PayPal ก่อนยิง (status ต้อง COMPLETED/PARTIALLY_REFUNDED)
+        - ยอดคืน <= ยอดคงเหลือคืนได้ (capture - REFUND_SUCCEEDED ใน ledger)
+        - dispute ยังเปิดอยู่ -> ต้อง resolve_dispute ก่อนเสมอ (refund ไม่ใช่
+          ทางลัดข้าม dispute); dispute_resolution=True ใช้บันทึกว่า refund นี้
+          เป็นการระงับข้อพิพาทที่ resolve แบบ upheld แล้วเท่านั้น
+        - ใช้ _execute_op (idempotent, key ต่อครั้ง: judgepay-{task}-refund-{seq})
+        - timeout/ผลคลุมเครือ -> NEEDS_RECONCILIATION (ห้ามสรุปว่าล้มเหลว)
+        - คืนเต็ม -> task REFUNDED; คืนบางส่วน -> task คงสถานะเดิม
+        - นี่คืนจาก capture เท่านั้น — ดึงเงินจากผู้รับ payout คืนไม่ได้
+        """
+        task = self._require(task_id)
+        self._check_owner(task, owner_id)
+        if not human_confirm:
+            raise EscrowError(
+                "refund requires explicit human confirmation "
+                "(human_confirm=True) — refusing")
+        capture_id = task.get("capture_id")
+        if not capture_id:
+            raise EscrowError(
+                f"task {task_id} has no capture — nothing to refund")
+        open_d = self.store.get_open_dispute(task_id)
+        if open_d:
+            raise EscrowError(
+                f"dispute #{open_d['id']} still {open_d['status']} — "
+                "resolve it before refund")
+        resolution_note = ""
+        if dispute_resolution:
+            rd = self.store.get_dispute(task_id)
+            if not rd or rd["status"] != "RESOLVED_UPHELD":
+                raise EscrowError(
+                    "dispute_resolution=True requires a dispute resolved "
+                    "as 'upheld'")
+            resolution_note = f" (dispute #{rd['id']} resolution)"
+        # กันยิง refund ซ้อน: ถ้ามี refund op ที่ยังไม่จบ (ค้าง/ผลคลุมเครือ)
+        # ห้ามเปิดอันใหม่ด้วย key ใหม่ — ต้อง reconcile อันเก่าให้จบก่อน
+        # (ไม่งั้นอาจคืนซ้ำ: timeout ครั้งแรกอาจสำเร็จที่ PayPal แล้ว)
+        # เช็กก่อนถาม capture — สถานะ op ของเราสำคัญกว่าสถานะ PayPal ตอนนี้
+        for o in self.store.list_operations(task_id):
+            if o["op_type"] == "refund" and o["status"] in (
+                    "INTENDED", "SENT", "NEEDS_RECONCILIATION"):
+                raise EscrowError(
+                    f"refund {o['idempotency_key']} is {o['status']} — "
+                    "run reconcile before requesting another refund")
+        # ตรวจ capture จริงก่อนยิง — ไม่เชื่อ DB อย่างเดียว
+        try:
+            cap = self.paypal.get_capture(capture_id)
+        except (PayPalError, requests.Timeout, requests.ConnectionError) as e:
+            raise EscrowError(f"cannot verify capture before refund: {e}")
+        cap_status = (cap.get("status") or "").upper()
+        cap_amt = float((cap.get("amount") or {}).get("value") or 0)
+        cap_cur = ((cap.get("amount") or {}).get("currency")
+                   or task.get("currency") or "USD").upper()
+        if (task.get("currency") or "").upper() != cap_cur:
+            raise EscrowError(
+                f"currency mismatch: capture {cap_cur} != task "
+                f"{task.get('currency')} — refusing")
+        refunded = self.store.ledger_sum(task_id, ["REFUND_SUCCEEDED"])
+        refundable = round(cap_amt - refunded, 2)
+        if refundable <= 0:
+            # คืนครบแล้ว (ledger ตรงกับ PayPal) — ไม่ต้องดูสถานะ capture
+            raise EscrowError("nothing left to refund on this capture")
+        if cap_status not in ("COMPLETED", "PARTIALLY_REFUNDED"):
+            # ledger บอกว่าเหลือคืนได้ แต่ PayPal บอกสถานะไม่เอื้อ —
+            # ไม่ตรงกัน -> อย่าคืน ให้ reconcile ก่อน (fail-closed)
+            raise EscrowError(
+                f"capture status is {cap_status} but ledger shows "
+                f"{refundable:.2f} {cap_cur} refundable — not refundable; "
+                "NEEDS_RECONCILIATION (run reconcile)")
+        if amount is None:
+            amount = refundable
+        amount = float(amount)
+        if amount <= 0 or amount > refundable + 1e-9:
+            raise EscrowError(
+                f"refund amount {amount:.2f} invalid — refundable is "
+                f"{refundable:.2f} {cap_cur}")
+        # stable key ต่อครั้งที่ขอ refund — retry ด้วย key เดิมปลอดภัย
+        seq = sum(1 for o in self.store.list_operations(task_id)
+                  if o["op_type"] == "refund") + 1
+        key = f"judgepay-{task_id}-refund-{seq}"
+        try:
+            result = self._execute_op(
+                task, "refund",
+                op_overrides={"idempotency_key": key, "amount": amount,
+                              "currency": cap_cur, "recipient": ""})
+        except EscrowError as e:
+            # provider ปฏิเสธชัดเจน (op FAILED) -> บันทึกไว้ อย่าให้หาย
+            op = self.store.get_operation(key)
+            if op and op["status"] == "FAILED" and not self.store.ledger_has(
+                    task_id, "REFUND_FAILED", key):
+                self.store.ledger_append(
+                    task_id, "REFUND_FAILED", amount=amount,
+                    currency=cap_cur, ref=key,
+                    note=f"PayPal refused: {str(e)[:200]}{resolution_note}")
+            raise
+        return self._apply_refund_result(
+            task_id, result, cap_amt=cap_amt, cap_cur=cap_cur,
+            extra_note=resolution_note)
+
+    def _apply_refund_result(self, task_id, result, cap_amt=None, cap_cur="",
+                             extra_note="", actions=None):
+        """ปรับ ledger/task ตามผล refund — idempotent (เรียกซ้ำไม่เขียนซ้ำ).
+
+        COMPLETED -> REFUND_SUCCEEDED (+ task REFUNDED ถ้าคืนครบ)
+        PENDING    -> REFUND_INTENT + task NEEDS_RECONCILIATION (รอ sync)
+        FAILED/CANCELLED/DENIED -> REFUND_FAILED
+        UNKNOWN    -> ถาม get_refund ก่อน; ยังไม่รู้ -> NEEDS_RECONCILIATION
+        """
+        task = self._require(task_id)
+        refund_id = result.get("refund_id") or ""
+        status = (result.get("status") or "UNKNOWN").upper()
+        amt = result.get("amount") or {}
+        try:
+            ramt = float(amt.get("value") or 0)
+        except (TypeError, ValueError):
+            ramt = 0.0
+        rcur = (amt.get("currency") or cap_cur or task.get("currency") or "")
+        if status == "UNKNOWN" and refund_id:
+            # replay ของเดิม — ถามสถานะจริงจาก PayPal
+            try:
+                r = self.paypal.get_refund(refund_id)
+                status = (r.get("status") or "UNKNOWN").upper()
+                ramt = float((r.get("amount") or {}).get("value") or ramt)
+                rcur = (r.get("amount") or {}).get("currency") or rcur
+                if actions is not None:
+                    actions.append(f"get_refund {refund_id} -> {status}")
+            except (PayPalError, requests.Timeout,
+                    requests.ConnectionError) as e:
+                if actions is not None:
+                    actions.append(f"get_refund {refund_id} failed: {e}")
+        note = (extra_note or "").strip()
+        if status == "COMPLETED":
+            if refund_id and not self.store.ledger_has(
+                    task_id, "REFUND_SUCCEEDED", refund_id):
+                self.store.ledger_append(
+                    task_id, "REFUND_SUCCEEDED", amount=ramt, currency=rcur,
+                    ref=refund_id, note=f"PayPal refund completed{note}")
+            total = cap_amt if cap_amt else float(task.get("amount") or 0)
+            refunded = self.store.ledger_sum(task_id, ["REFUND_SUCCEEDED"])
+            if refunded + 1e-9 >= total and total > 0:
+                self.store.update_task(task_id, status="REFUNDED",
+                                       last_paypal_op=f"refund:{refund_id}")
+                task_status = "REFUNDED"
+            else:
+                task_status = self._require(task_id)["status"]
+            return {"success": True, "task_id": task_id, "refund_id": refund_id,
+                    "status": "COMPLETED", "amount": ramt, "currency": rcur,
+                    "refunded_total": round(refunded, 2),
+                    "task_status": task_status,
+                    "note": "money returned to payer's PayPal balance" + note}
+        if status == "PENDING":
+            if refund_id and not self.store.ledger_has(
+                    task_id, "REFUND_INTENT", refund_id):
+                self.store.ledger_append(
+                    task_id, "REFUND_INTENT", amount=ramt, currency=rcur,
+                    ref=refund_id,
+                    note=f"PayPal accepted refund, pending completion{note}")
+            self.store.update_task(task_id, status="NEEDS_RECONCILIATION",
+                                   last_paypal_op=f"refund:{refund_id}")
+            return {"success": True, "task_id": task_id, "refund_id": refund_id,
+                    "status": "PENDING", "amount": ramt, "currency": rcur,
+                    "task_status": "NEEDS_RECONCILIATION",
+                    "note": "refund pending at PayPal — reconcile later" + note}
+        if status in ("FAILED", "CANCELLED", "DENIED"):
+            if refund_id and not self.store.ledger_has(
+                    task_id, "REFUND_FAILED", refund_id):
+                self.store.ledger_append(
+                    task_id, "REFUND_FAILED", amount=ramt, currency=rcur,
+                    ref=refund_id,
+                    note=f"PayPal refund {status.lower()}{note}")
+            return {"success": True, "task_id": task_id, "refund_id": refund_id,
+                    "status": status, "amount": ramt, "currency": rcur,
+                    "task_status": self._require(task_id)["status"],
+                    "note": f"refund {status.lower()} — no money moved" + note}
+        # UNKNOWN / shape แปลก — อย่าเดา
+        self.store.update_task(task_id, status="NEEDS_RECONCILIATION",
+                               last_paypal_op=f"refund:{refund_id or 'unknown'}")
+        return {"success": False, "task_id": task_id, "refund_id": refund_id,
+                "status": "UNKNOWN", "task_status": "NEEDS_RECONCILIATION",
+                "note": "refund result unclear — reconcile before retry" + note}
+
+    def cancel_payout_item(self, task_id, payout_item_id, owner_id=""):
+        """ยกเลิก payout item ที่ผู้รับยังไม่รับ (UNCLAIMED) — B4.
+
+        เงินกลับเข้า PayPal balance ของผู้ส่ง ไม่ใช่กลับเข้า capture.
+        item ที่จ่ายถึงมือแล้ว (SUCCESS/PAID) หรือสถานะอื่น -> ปฏิเสธเสียงดัง
+        (เรียกเงินคืนจากผู้รับไม่ได้).
+        """
+        task = self._require(task_id)
+        self._check_owner(task, owner_id)
+        if not payout_item_id:
+            raise EscrowError("payout_item_id is required")
+        # ถาม item truth ล่าสุดก่อน — ไม่เชื่อสถานะเก่าใน DB
+        rp = self.refresh_payout(task_id)
+        item = next((i for i in rp.get("items", [])
+                     if i.get("payout_item_id") == payout_item_id), None)
+        if not item:
+            raise EscrowError(
+                f"payout item {payout_item_id} not found for task {task_id}")
+        if item["item_status"] != "UNCLAIMED":
+            raise EscrowError(
+                f"cannot cancel payout item in status {item['item_status']} "
+                f"(PayPal: {item['paypal_status']}) — only UNCLAIMED items "
+                "can be cancelled; money already paid cannot be recalled")
+        try:
+            res = self.paypal.cancel_payout_item(payout_item_id)
+        except (PayPalError, requests.Timeout, requests.ConnectionError) as e:
+            raise EscrowError(f"cancel payout item failed: {e}")
+        raw_status = (res.get("transaction_status") or "CANCELED").upper()
+        # normalize ผ่าน map เดียวกับ B2 (CANCELED->CANCELED; ถ้า PayPal คืน
+        # RETURNED ก็รองรับ — เงินกลับผู้ส่งเหมือนกัน)
+        from .payout_status import normalize_item_status
+        our_status = normalize_item_status(raw_status)
+        self.store.upsert_payout_item(
+            task_id, payout_item_id=payout_item_id,
+            transaction_id=item.get("transaction_id", ""),
+            sender_item_id="", receiver=item.get("receiver", ""),
+            amount=item.get("amount", 0), currency=item.get("currency", ""),
+            item_status=our_status, paypal_status=raw_status,
+            batch_id=task.get("payout_batch_id") or "",
+            batch_status=rp.get("batch_status") or "")
+        self.store.ledger_append(
+            task_id, "PAYOUT_ITEM_CANCELLED", amount=item.get("amount", 0),
+            currency=item.get("currency", ""), ref=payout_item_id,
+            note="unclaimed payout cancelled — money returns to sender's "
+                 "PayPal balance, NOT to the capture")
+        return {"success": True, "task_id": task_id,
+                "payout_item_id": payout_item_id,
+                "item_status": our_status, "paypal_status": raw_status,
+                "note": "money returns to sender's PayPal balance, "
+                        "not to the capture"}
+
     # ---------- B1: idempotent operation executor ----------
 
-    def _execute_op(self, task, op_type, reconcile_mode=False):
+    def _execute_op(self, task, op_type, reconcile_mode=False, op_overrides=None):
         """รัน PayPal operation แบบ idempotent — หัวใจของ B1.
 
         1. record_intent ลง DB ก่อนยิงเสมอ (crash-safe; key ซ้ำ -> ใช้ row เดิม)
@@ -581,15 +929,22 @@ class EscrowService:
            - timeout / connection / 5xx / duplicate-indicator -> NEEDS_RECONCILIATION
              (ห้าม mark FAILED เด็ดขาด — timeout ไม่ใช่หลักฐานว่าล้มเหลว)
            - 400/404/422 ชัดเจน (ไม่ใช่ duplicate) -> FAILED
+
+        op_overrides (B4): {"idempotency_key", "amount", "currency", "recipient"} —
+        ใช้เมื่อ op หนึ่ง task มีได้หลายครั้ง (เช่น refund หลายรอบ) แต่ละครั้ง
+        ต้องมี key ของตัวเอง. ไม่ส่ง = derive แบบเดิม (B1 ไม่เปลี่ยน).
         """
         task_id = task["id"]
-        key = _op_key(task_id, op_type)
-        req_hash = _request_hash(op_type, task["amount"], task["currency"],
-                                 task.get("worker_email") or "")
+        ov = op_overrides or {}
+        key = ov.get("idempotency_key") or _op_key(task_id, op_type)
+        amount = ov.get("amount", task["amount"])
+        currency = ov.get("currency", task["currency"])
+        recipient = ov.get("recipient", task.get("worker_email") or "")
+        req_hash = _request_hash(op_type, amount if amount is not None else 0,
+                                 currency, recipient)
         op = self.store.record_intent(
             task_id, op_type, key, req_hash,
-            amount=task["amount"], currency=task["currency"],
-            recipient=task.get("worker_email") or "",
+            amount=amount, currency=currency, recipient=recipient,
         )
         if op["request_hash"] != req_hash:
             raise EscrowError(
@@ -666,10 +1021,27 @@ class EscrowService:
             auth_id = task["authorization_id"]
             return lambda key, _op: self.paypal.void_authorization(
                 auth_id, idempotency_key=key)
+        if op_type == "refund":
+            # B4: ใช้ค่าตอน intent (เก็บใน op row) — กัน task เปลี่ยนระหว่างทาง
+            capture_id = task.get("capture_id")
+            amount = op["amount"]
+            currency = op["currency"] or task["currency"]
+            return lambda key, _op: self.paypal.refund_capture(
+                capture_id, amount=amount,
+                currency=currency, idempotency_key=key,
+                note=f"JudgePay task-{task['id']} refund")
         raise EscrowError(f"unknown op_type: {op_type}")
 
     def _reconcile_op(self, task, op):
         """replay op ที่ค้างด้วย key เดิม — ปลอดภัย ไม่ทำซ้ำ."""
+        if op["op_type"] == "refund":
+            # B4: refund มีหลาย key ต่อ task — ใช้ key/amount ของ op ตัวนั้นเอง
+            return self._execute_op(
+                task, "refund", reconcile_mode=True,
+                op_overrides={"idempotency_key": op["idempotency_key"],
+                              "amount": op["amount"],
+                              "currency": op["currency"],
+                              "recipient": op["recipient"] or ""})
         return self._execute_op(task, op["op_type"], reconcile_mode=True)
 
     # ---------- 5. หมดเวลา ----------
@@ -704,13 +1076,63 @@ class EscrowService:
         for op in self.store.list_operations(task_id):
             if op["status"] in ("INTENDED", "SENT", "NEEDS_RECONCILIATION"):
                 try:
-                    self._reconcile_op(task, op)
+                    res = self._reconcile_op(task, op)
                     new = self.store.get_operation(op["idempotency_key"])
                     actions.append(
                         f"op {op['op_type']}: {op['status']} -> {new['status']}")
+                    # B4: refund ที่ replay สำเร็จ -> sync สถานะจริงจาก PayPal
+                    if (op["op_type"] == "refund"
+                            and new["status"] == "SUCCEEDED"
+                            and new.get("paypal_ref")):
+                        self._apply_refund_result(
+                            task_id, {**res,
+                                      "refund_id": new["paypal_ref"]},
+                            actions=actions)
+                        actions.append(
+                            f"refund {new['paypal_ref']} synced")
                 except EscrowError as e:
                     actions.append(f"op {op['op_type']} unresolved: {e}")
                 task = self._require(task_id)  # refresh หลัง op อาจเปลี่ยน task
+        # 1b. B4: sync refund ที่ op SUCCEEDED แล้วแต่ ledger ยังไม่บันทึก
+        # (เช่น crash ระหว่าง op สำเร็จกับเขียน ledger, หรือ refund ค้าง PENDING)
+        for op in self.store.list_operations(task_id):
+            if (op["op_type"] == "refund" and op["status"] == "SUCCEEDED"
+                    and op.get("paypal_ref")
+                    and not self.store.ledger_has(
+                        task_id, "REFUND_SUCCEEDED", op["paypal_ref"])):
+                try:
+                    r = self.paypal.get_refund(op["paypal_ref"])
+                    st = (r.get("status") or "").upper()
+                    actions.append(
+                        f"refund {op['paypal_ref']} at PayPal -> {st}")
+                    if st == "COMPLETED":
+                        self._apply_refund_result(
+                            task_id,
+                            {"refund_id": op["paypal_ref"], "status": "COMPLETED",
+                             "amount": r.get("amount", {})},
+                            actions=actions)
+                    elif st in ("FAILED", "CANCELLED", "DENIED"):
+                        self._apply_refund_result(
+                            task_id,
+                            {"refund_id": op["paypal_ref"], "status": st,
+                             "amount": r.get("amount", {})},
+                            actions=actions)
+                    else:
+                        actions.append(
+                            f"refund {op['paypal_ref']} still {st} — "
+                            "kept NEEDS_RECONCILIATION, no new refund sent")
+                        self.store.update_task(
+                            task_id, status="NEEDS_RECONCILIATION",
+                            last_paypal_op=f"refund:{op['paypal_ref']}")
+                except (PayPalError, requests.Timeout,
+                        requests.ConnectionError) as e:
+                    actions.append(f"get_refund {op['paypal_ref']} failed: {e}")
+        # 1c. B4: dispute รายงานอย่างเดียว — ห้าม auto-close/auto-resolve
+        d = self.store.get_open_dispute(task_id)
+        if d:
+            actions.append(
+                f"dispute #{d['id']} still {d['status']} (by {d['opened_by']}) — "
+                "no auto-close; needs human resolve_dispute")
         # 2. backfill refs จาก ops (crash ระหว่าง op สำเร็จกับ update task)
         ops = {o["op_type"]: o for o in self.store.list_operations(task_id)}
         updates = {}

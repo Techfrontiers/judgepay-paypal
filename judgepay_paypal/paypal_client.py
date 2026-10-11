@@ -99,10 +99,14 @@ class PayPalClient:
         self._idem_capture = {}
         self._payout_idem = {}
         self._void_idem = {}
+        # B4: refunds — persist ด้วย (กัน crash แล้วไม่รู้ว่าคืนเงินไปหรือยัง)
+        self._refunds = {}
+        self._idem_refund = {}
         # lock กัน race ใน mock (จำลอง server-side idempotency ของ PayPal)
         self._mock_lock = threading.Lock()
         # ตัวนับ "ยิงจริง" (ไม่นับ replay) — ไว้ assert ในเทส
-        self._mock_calls = {"capture_exec": 0, "payout_exec": 0, "void_exec": 0}
+        self._mock_calls = {"capture_exec": 0, "payout_exec": 0,
+                            "void_exec": 0, "refund_exec": 0}
         if self.mock:
             self._load_mock()
 
@@ -120,6 +124,8 @@ class PayPalClient:
             self._idem_capture = data.get("idem_capture", {})
             self._payout_idem = data.get("payout_idem", {})
             self._void_idem = data.get("void_idem", {})
+            self._refunds = data.get("refunds", {})
+            self._idem_refund = data.get("idem_refund", {})
         except (FileNotFoundError, ValueError):
             pass
 
@@ -133,6 +139,8 @@ class PayPalClient:
                 "idem_capture": self._idem_capture,
                 "payout_idem": self._payout_idem,
                 "void_idem": self._void_idem,
+                "refunds": self._refunds,
+                "idem_refund": self._idem_refund,
             }, f)
 
     # ---------- auth ----------
@@ -565,3 +573,158 @@ class PayPalClient:
             raise PayPalError(f"mock: unknown payout item {payout_item_id}")
         res = self._get(f"/v1/payments/payouts-item/{payout_item_id}")
         return self._normalize_real_item(res)
+
+    # ---------- Payments v2: capture + refund (B4) ----------
+
+    def _mock_refunded_total(self, capture_id):
+        """ยอดที่คืนสำเร็จแล้วของ capture นี้ (mock)."""
+        return sum(
+            float(r["amount"]["value"])
+            for r in self._refunds.values()
+            if r.get("capture_id") == capture_id and r.get("status") == "COMPLETED"
+        )
+
+    def get_capture(self, capture_id):
+        """ดึง capture — ตรวจสถานะ/ยอดก่อน refund (B4).
+
+        คืน {"capture_id", "status", "amount": {"currency", "value"}}.
+        สถานะ mock derived จาก refund ที่สำเร็จแล้ว เหมือน PayPal จริง
+        (COMPLETED -> PARTIALLY_REFUNDED -> REFUNDED).
+        """
+        if self.mock:
+            c = self._captures.get(capture_id)
+            if not c:
+                raise PayPalError(f"mock: unknown capture {capture_id}")
+            total = float(c["amount"])
+            refunded = self._mock_refunded_total(capture_id)
+            if refunded + 1e-9 >= total:
+                status = "REFUNDED"
+            elif refunded > 0:
+                status = "PARTIALLY_REFUNDED"
+            else:
+                status = c["status"]
+            return {"capture_id": capture_id, "status": status,
+                    "amount": {"currency": c["currency"], "value": c["amount"]}}
+        res = self._get(f"/v2/payments/captures/{capture_id}")
+        amt = res.get("amount", {}) or {}
+        return {"capture_id": res["id"], "status": res.get("status"),
+                "amount": {"currency": amt.get("currency_code"),
+                           "value": amt.get("value")}}
+
+    def refund_capture(self, capture_id, amount=None, currency="USD",
+                       idempotency_key=None, note=""):
+        """คืนเงินจาก capture — เงินกลับเข้า PayPal balance ของผู้จ่าย (B4).
+
+        amount=None = คืนเต็มจำนวนคงเหลือ; ระบุ amount = คืนบางส่วน.
+        สำคัญ: นี่คืนเงินจาก capture เท่านั้น — ดึงเงินคืนจากผู้รับ payout ไม่ได้.
+        B1: ส่ง PayPal-Request-Id ที่เสถียร — retry ด้วย key เดิมไม่คืนซ้ำ.
+        """
+        fail_mode = os.getenv("PAYPAL_MOCK_FAIL_MODE", "")
+        if self.mock:
+            key = idempotency_key or f"mock-{uuid.uuid4().hex}"
+            with self._mock_lock:
+                # replay ด้วย key เดิม -> คืนผลเดิม ไม่คืนซ้ำ
+                if key in self._idem_refund:
+                    return dict(self._idem_refund[key])
+                c = self._captures.get(capture_id)
+                if not c:
+                    raise PayPalError(f"mock: unknown capture {capture_id}")
+                if fail_mode == "error_422_refund":
+                    raise PayPalError(
+                        "POST /v2/payments/captures/x/refund -> 422: "
+                        "UNPROCESSABLE_ENTITY: refund not allowed for this capture")
+                total = float(c["amount"])
+                refundable = total - self._mock_refunded_total(capture_id)
+                if amount is None:
+                    amount = round(refundable, 2)
+                amount = float(amount)
+                if amount <= 0 or amount > refundable + 1e-9:
+                    raise PayPalError(
+                        "POST /v2/payments/captures/x/refund -> 422: "
+                        f"refund amount {amount:.2f} exceeds refundable "
+                        f"{refundable:.2f}")
+                status = os.getenv("PAYPAL_MOCK_REFUND_STATUS", "COMPLETED").upper()
+                if status not in ("COMPLETED", "PENDING", "FAILED"):
+                    status = "COMPLETED"
+                refund_id = _fake_id()
+                self._refunds[refund_id] = {
+                    "status": status,
+                    "amount": {"currency": currency, "value": f"{amount:.2f}"},
+                    "capture_id": capture_id,
+                    "note": note or "",
+                }
+                result = {"refund_id": refund_id, "status": status,
+                          "amount": {"currency": currency,
+                                     "value": f"{amount:.2f}"}}
+                self._idem_refund[key] = result
+                self._save_mock()
+                self._mock_calls["refund_exec"] += 1
+                if fail_mode == "timeout_after_refund":
+                    # ฝั่ง server สำเร็จแล้ว แต่ client เจอ timeout (จำลองของจริง)
+                    raise requests.Timeout("mock: timeout after refund succeeded")
+                return result
+        key = idempotency_key or str(uuid.uuid4())
+        body = {}
+        if amount is not None:
+            body["amount"] = {"currency_code": currency,
+                              "value": f"{float(amount):.2f}"}
+        if note:
+            body["note_to_payer"] = note[:1000]
+        res = self._post(f"/v2/payments/captures/{capture_id}/refund", body,
+                         extra_headers={"PayPal-Request-Id": key})
+        amt = res.get("amount", {}) or {}
+        return {"refund_id": res["id"], "status": res.get("status"),
+                "amount": {"currency": amt.get("currency"),
+                           "value": amt.get("total") or amt.get("value")}}
+
+    def get_refund(self, refund_id):
+        """ดึงสถานะ refund — ไว้ reconcile / sync (B4)."""
+        if self.mock:
+            r = self._refunds.get(refund_id)
+            if not r:
+                raise PayPalError(f"mock: unknown refund {refund_id}")
+            return {"refund_id": refund_id, "status": r["status"],
+                    "amount": dict(r["amount"])}
+        res = self._get(f"/v2/payments/refunds/{refund_id}")
+        amt = res.get("amount", {}) or {}
+        return {"refund_id": res["id"], "status": res.get("status"),
+                "amount": {"currency": amt.get("currency"),
+                           "value": amt.get("total") or amt.get("value")}}
+
+    def cancel_payout_item(self, payout_item_id):
+        """ยกเลิก payout item ที่ UNCLAIMED — เงินกลับเข้า balance ผู้ส่ง (B4).
+
+        ทำได้เฉพาะ item ที่ผู้รับยังไม่รับเท่านั้น —
+        เงินที่ถึงมือแล้ว (SUCCESS/PAID) เรียกคืนไม่ได้เด็ดขาด.
+        หมายเหตุ: เงินกลับเข้า PayPal balance ของผู้ส่ง ไม่ใช่กลับเข้า capture.
+        """
+        if self.mock:
+            with self._mock_lock:
+                for b in self._payouts.values():
+                    for it in b.get("items", []):
+                        if it.get("payout_item_id") == payout_item_id:
+                            st = (it.get("transaction_status") or "").upper()
+                            if st != "UNCLAIMED":
+                                raise PayPalError(
+                                    f"mock: cannot cancel payout item in status "
+                                    f"{st} (only UNCLAIMED can be cancelled)")
+                            it["transaction_status"] = "CANCELED"
+                            self._save_mock()
+                            return {"payout_item_id": payout_item_id,
+                                    "transaction_status": "CANCELED"}
+                raise PayPalError(f"mock: unknown payout item {payout_item_id}")
+        r = requests.post(
+            f"{self.base}/v1/payments/payouts-item/{payout_item_id}/cancel",
+            json={}, headers=self._headers(), timeout=30,
+        )
+        if r.status_code == 204:
+            # 204 No Content = ยกเลิกสำเร็จ (เหมือน void)
+            return {"payout_item_id": payout_item_id,
+                    "transaction_status": "CANCELED"}
+        if r.status_code not in (200, 201):
+            raise PayPalError(
+                f"POST /v1/payments/payouts-item/{payout_item_id}/cancel "
+                f"-> {r.status_code}: {r.text[:400]}")
+        body = r.json()
+        return {"payout_item_id": payout_item_id,
+                "transaction_status": body.get("transaction_status", "CANCELED")}

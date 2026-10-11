@@ -303,7 +303,7 @@ def test_judge_makes_zero_money_calls(svc):
     tid = submit_flow(svc)
     svc.judge_only(tid)
     assert svc.paypal._mock_calls == {"capture_exec": 0, "payout_exec": 0,
-                                      "void_exec": 0}
+                                      "void_exec": 0, "refund_exec": 0}
 
 
 def test_judge_error_makes_zero_money_calls(tmp_path, monkeypatch):

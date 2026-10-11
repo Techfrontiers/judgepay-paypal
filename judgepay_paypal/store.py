@@ -74,7 +74,9 @@ _OP_TRANSITIONS = {
 #   | PAYOUT_RETURNED (เงินตีกลับ)
 STATUSES = ("AWAITING_APPROVAL", "OPEN", "SUBMITTED", "JUDGED", "NEEDS_REVIEW",
             "SETTLING", "COMPLETED", "REFUNDED", "EXPIRED", "NEEDS_RECONCILIATION",
-            "PAYOUT_PENDING", "PAYOUT_FAILED", "PAYOUT_RETURNED")
+            "PAYOUT_PENDING", "PAYOUT_FAILED", "PAYOUT_RETURNED",
+            # B4: DISPUTED — มีข้อพิพาทค้างอยู่ ระงับ settlement จนกว่าจะ resolve
+            "DISPUTED")
 
 # B2: item-level payout lifecycle — เงินถึงมือผู้รับแต่ละรายจริงไหม
 # Rollback: DROP TABLE payout_items (task/operations ไม่กระทบ)
@@ -98,6 +100,48 @@ CREATE TABLE IF NOT EXISTS payout_items (
 );
 CREATE INDEX IF NOT EXISTS idx_payout_items_task ON payout_items(task_id);
 """
+
+# B4: dispute lifecycle + ledger — ตรวจสอบย้อนหลังได้ทุกเหตุการณ์เงินขยับ
+# Rollback: DROP TABLE disputes / DROP TABLE ledger (task/operations ไม่กระทบ)
+# กฎ: ledger เป็น append-only — ห้าม UPDATE/DELETE ประวัติเพื่อ "ให้ยอดตรง"
+DISPUTES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS disputes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    opened_by TEXT NOT NULL,          -- ใครเปิด (requester/worker/operator)
+    reason TEXT NOT NULL,
+    status TEXT NOT NULL,             -- OPEN|UNDER_REVIEW|RESOLVED_UPHELD|RESOLVED_REJECTED|CLOSED
+    evidence TEXT DEFAULT '[]',       -- JSON list ของ {by, note, at}
+    reviewer TEXT DEFAULT '',         -- มนุษย์เท่านั้น — AI judge ตัดสิน dispute ไม่ได้
+    decision TEXT DEFAULT '',         -- upheld | rejected
+    decided_at TEXT DEFAULT '',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_disputes_task ON disputes(task_id);
+"""
+
+LEDGER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS ledger (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    event TEXT NOT NULL,              -- DISPUTE_OPENED|DISPUTE_CLOSED|REFUND_INTENT|
+                                      -- REFUND_SUCCEEDED|REFUND_FAILED|PAYOUT_ITEM_CANCELLED
+    amount REAL DEFAULT 0,
+    currency TEXT DEFAULT '',
+    ref TEXT DEFAULT '',              -- PayPal resource id (refund_id / dispute id / item id)
+    note TEXT DEFAULT '',
+    created_at TEXT NOT NULL,
+    -- กันเขียนซ้ำตอน concurrent/reconcile (เช่น สอง thread บันทึก REFUND_SUCCEEDED
+    -- ของ refund_id เดียวกัน) — ซ้ำ -> คืน id เดิม ไม่ error
+    UNIQUE(task_id, event, ref)
+);
+CREATE INDEX IF NOT EXISTS idx_ledger_task ON ledger(task_id);
+"""
+
+DISPUTE_STATUSES = ("OPEN", "UNDER_REVIEW", "RESOLVED_UPHELD",
+                    "RESOLVED_REJECTED", "CLOSED")
+# dispute ที่ยัง "ค้าง" — เปิดใหม่ซ้ำไม่ได้, settlement ถูกระงับ
+_OPEN_DISPUTE_STATUSES = ("OPEN", "UNDER_REVIEW")
 
 # คอลัมน์ที่เพิ่มหลัง schema แรก — migrate ให้ DB เก่าอัตโนมัติ
 _MIGRATIONS = (
@@ -139,6 +183,8 @@ class TaskStore:
             c.executescript(SCHEMA)
             c.executescript(OPERATIONS_SCHEMA)
             c.executescript(PAYOUT_ITEMS_SCHEMA)
+            c.executescript(DISPUTES_SCHEMA)
+            c.executescript(LEDGER_SCHEMA)
             cols = {r[1] for r in c.execute("PRAGMA table_info(tasks)").fetchall()}
             for name, ddl in _MIGRATIONS:
                 if name not in cols:
@@ -344,3 +390,114 @@ class TaskStore:
                 (task_id,),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    # ---------- B4: disputes ----------
+
+    def create_dispute(self, task_id, opened_by, reason):
+        """เปิด dispute — สถานะเริ่ม OPEN; ระงับ settlement ที่ชั้น escrow."""
+        with self._conn() as c:
+            cur = c.execute(
+                """INSERT INTO disputes
+                   (task_id, opened_by, reason, status, evidence, created_at)
+                   VALUES (?, ?, ?, 'OPEN', '[]', ?)""",
+                (task_id, opened_by, reason, utcnow()),
+            )
+            did = cur.lastrowid
+            row = c.execute("SELECT * FROM disputes WHERE id = ?",
+                            (did,)).fetchone()
+        return dict(row)
+
+    def get_dispute(self, task_id):
+        """dispute ล่าสุดของ task (สถานะใดก็ได้)."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM disputes WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def get_open_dispute(self, task_id):
+        """dispute ที่ยังค้าง (OPEN/UNDER_REVIEW) — ถ้ามีคือ settlement ถูกระงับ."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT * FROM disputes WHERE task_id = ? AND status IN "
+                "('OPEN', 'UNDER_REVIEW') ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+        return dict(row) if row else None
+
+    def update_dispute(self, dispute_id, **fields):
+        if not fields:
+            return
+        if "status" in fields and fields["status"] not in DISPUTE_STATUSES:
+            raise ValueError(f"unknown dispute status: {fields['status']}")
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        with self._conn() as c:
+            c.execute(f"UPDATE disputes SET {sets} WHERE id = ?",
+                      (*fields.values(), dispute_id))
+
+    def list_disputes(self, task_id):
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM disputes WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ---------- B4: ledger (append-only) ----------
+
+    def ledger_append(self, task_id, event, amount=0.0, currency="",
+                      ref="", note=""):
+        """บันทึกเหตุการณ์เงิน/ข้อพิพาท — append-only ห้ามแก้ประวัติ.
+
+        (task_id, event, ref) ซ้ำ (เช่น concurrent thread) -> คืน id เดิม
+        ไม่เขียนซ้ำ ไม่ raise.
+        """
+        with self._conn() as c:
+            try:
+                cur = c.execute(
+                    """INSERT INTO ledger
+                       (task_id, event, amount, currency, ref, note, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (task_id, event, float(amount or 0), currency or "",
+                     ref or "", note or "", utcnow()),
+                )
+                return cur.lastrowid
+            except sqlite3.IntegrityError:
+                row = c.execute(
+                    "SELECT id FROM ledger WHERE task_id = ? AND event = ? "
+                    "AND ref = ?",
+                    (task_id, event, ref or ""),
+                ).fetchone()
+                return row["id"] if row else None
+
+    def ledger_list(self, task_id):
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM ledger WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def ledger_sum(self, task_id, events):
+        """ยอดรวมของ events ที่ระบุ — ไว้คำนวณยอด refundable / กันคืนเกิน."""
+        if not events:
+            return 0.0
+        placeholders = ", ".join("?" for _ in events)
+        with self._conn() as c:
+            row = c.execute(
+                f"SELECT COALESCE(SUM(amount), 0) AS total FROM ledger "
+                f"WHERE task_id = ? AND event IN ({placeholders})",
+                (task_id, *events),
+            ).fetchone()
+        return float(row["total"] or 0)
+
+    def ledger_has(self, task_id, event, ref):
+        """มี event+ref นี้บันทึกแล้วหรือยัง — กันเขียนซ้ำตอน reconcile."""
+        with self._conn() as c:
+            row = c.execute(
+                "SELECT 1 FROM ledger WHERE task_id = ? AND event = ? AND ref = ? "
+                "LIMIT 1",
+                (task_id, event, ref),
+            ).fetchone()
+        return row is not None
