@@ -318,3 +318,19 @@ def test_settle_uses_stable_keys_end_to_end(svc):
     assert cap_op["status"] == "SUCCEEDED" and pay_op["status"] == "SUCCEEDED"
     # mock จำ batch ตาม sender_batch_id ที่เสถียร
     assert f"judgepay-{tid}-payout" in svc.paypal._payout_idem
+
+
+def test_parse_duplicate_link_real_paypal_error_shape():
+    """regression: error จริงของ PayPal ไม่มีคำว่า DUPLICATE
+    (USER_BUSINESS_ERROR + 'already exists') — parser ต้องจับได้."""
+    from judgepay_paypal.paypal_client import _parse_duplicate_payout_link
+    real_err = (
+        'POST /v1/payments/payouts -> 400: {"name":"USER_BUSINESS_ERROR",'
+        '"details":[{"field":"SENDER_BATCH_ID","location":"body",'
+        '"issue":"Batch with given sender_batch_id already exists",'
+        '"link":[{"href":"https://api.sandbox.paypal.com/v1/payments/payouts/UW9PA5HUJWAX6",'
+        '"rel":"self","method":"GET"}]}]}'
+    )
+    assert _parse_duplicate_payout_link(real_err) == "UW9PA5HUJWAX6"
+    # ไม่ใช่ duplicate -> None
+    assert _parse_duplicate_payout_link("POST -> 500: INTERNAL_SERVER_ERROR") is None

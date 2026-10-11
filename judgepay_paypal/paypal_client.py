@@ -49,8 +49,15 @@ def _parse_duplicate_payout_link(err_text):
 
     PayPal จะ reject sender_batch_id ซ้ำพร้อม link ไป batch ต้นฉบับ —
     คืน payout_batch_id หรือ None ถ้าไม่ใช่ duplicate error.
+
+    หมายเหตุ (bug จาก sandbox E2E จริง): error จริงของ PayPal เป็น
+    USER_BUSINESS_ERROR + "Batch with given sender_batch_id already exists"
+    ไม่มีคำว่า DUPLICATE — ต้องจับทั้งสองรูป.
     """
-    if "DUPLICATE" not in err_text.upper():
+    upper = err_text.upper()
+    is_dup = ("DUPLICATE" in upper
+              or ("SENDER_BATCH_ID" in upper and "ALREADY EXISTS" in upper))
+    if not is_dup:
         return None
     m = re.search(r"/v1/payments/payouts/([A-Za-z0-9_-]+)", err_text)
     return m.group(1) if m else None
