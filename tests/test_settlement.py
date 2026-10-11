@@ -179,3 +179,36 @@ def test_judge_reject_voids(svc):
     assert jr["status"] == "REFUNDED"
     auth = svc.paypal.get_authorization(svc.get_task(tid)["authorization_id"])
     assert auth["status"] == "VOIDED"
+
+
+def test_void_handles_http_204_success(monkeypatch):
+    """PayPal void ตอบ 204 No Content = สำเร็จ — ห้าม raise (bug เจอจาก sandbox E2E จริง)."""
+    from judgepay_paypal import paypal_client as pc_mod
+    from judgepay_paypal.paypal_client import PayPalClient, PayPalError
+
+    class Resp204:
+        status_code = 204
+        text = ""
+
+    monkeypatch.setattr(pc_mod.requests, "post", lambda *a, **k: Resp204())
+    monkeypatch.setattr(PayPalClient, "_headers", lambda self, extra=None: {})
+    c = PayPalClient(client_id="x", client_secret="y", mode="sandbox", mock=False)
+    assert not c.mock
+    r = c.void_authorization("AUTH123")
+    assert r == {"authorization_id": "AUTH123", "status": "VOIDED"}
+
+
+def test_void_raises_on_real_error(monkeypatch):
+    """204 ผ่าน แต่ error จริงต้องยัง raise (patch ต้องไม่กลืน error)."""
+    from judgepay_paypal import paypal_client as pc_mod
+    from judgepay_paypal.paypal_client import PayPalClient, PayPalError
+
+    class Resp500:
+        status_code = 500
+        text = "internal error"
+
+    monkeypatch.setattr(pc_mod.requests, "post", lambda *a, **k: Resp500())
+    monkeypatch.setattr(PayPalClient, "_headers", lambda self, extra=None: {})
+    c = PayPalClient(client_id="x", client_secret="y", mode="sandbox", mock=False)
+    with pytest.raises(PayPalError, match="500"):
+        c.void_authorization("AUTH123")

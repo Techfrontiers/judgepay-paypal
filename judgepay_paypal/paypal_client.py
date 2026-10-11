@@ -244,8 +244,19 @@ class PayPalClient:
             a["status"] = "VOIDED"
             self._save_mock()
             return {"authorization_id": auth_id, "status": "VOIDED"}
-        res = self._post(f"/v2/payments/authorizations/{auth_id}/void", {})
-        return {"authorization_id": auth_id, "status": res.get("status", "VOIDED")}
+        # PayPal ตอบ 204 No Content = void สำเร็จ (ไม่มี body) — ห้าม treat เป็น error
+        r = requests.post(
+            f"{self.base}/v2/payments/authorizations/{auth_id}/void",
+            json={}, headers=self._headers(), timeout=30,
+        )
+        if r.status_code == 204:
+            return {"authorization_id": auth_id, "status": "VOIDED"}
+        if r.status_code not in (200, 201):
+            raise PayPalError(
+                f"POST /v2/payments/authorizations/{auth_id}/void "
+                f"-> {r.status_code}: {r.text[:400]}"
+            )
+        return {"authorization_id": auth_id, "status": r.json().get("status", "VOIDED")}
 
     # ---------- Payouts v1 ----------
 
