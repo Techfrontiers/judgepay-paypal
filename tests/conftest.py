@@ -47,6 +47,8 @@ def svc(tmp_path, monkeypatch):
     monkeypatch.setenv("JUDGEPAY_AUTH_TOKEN", TOKEN)
     monkeypatch.setenv("JUDGEPAY_HMAC_SECRET", "test-hmac-secret")
     monkeypatch.delenv("PAYPAL_MOCK_PAYOUT_STATUS", raising=False)
+    monkeypatch.delenv("PAYPAL_MOCK_ITEM_STATUS", raising=False)
+    monkeypatch.delenv("PAYPAL_MOCK_ITEMS_JSON", raising=False)
     return EscrowService(paypal=PayPalClient(), store=TaskStore(),
                          judge=AIJudge(backend="mock"))
 

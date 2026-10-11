@@ -69,8 +69,35 @@ _OP_TRANSITIONS = {
 # สถานะ: AWAITING_APPROVAL -> OPEN -> SUBMITTED -> JUDGED | NEEDS_REVIEW
 #   -> SETTLING -> COMPLETED | NEEDS_RECONCILIATION
 #   SUBMITTED -> REFUNDED (reject/void) | EXPIRED
+# B2: สถานะ payout แยก 3 ระดับ — task ไม่สรุปจาก batch อย่างเดียว
+#   PAYOUT_PENDING (เงินยังไม่ถึงมือ) | PAYOUT_FAILED (ต้องคนตัดสินใจ ห้ามจ่ายซ้ำอัตโนมัติ)
+#   | PAYOUT_RETURNED (เงินตีกลับ)
 STATUSES = ("AWAITING_APPROVAL", "OPEN", "SUBMITTED", "JUDGED", "NEEDS_REVIEW",
-            "SETTLING", "COMPLETED", "REFUNDED", "EXPIRED", "NEEDS_RECONCILIATION")
+            "SETTLING", "COMPLETED", "REFUNDED", "EXPIRED", "NEEDS_RECONCILIATION",
+            "PAYOUT_PENDING", "PAYOUT_FAILED", "PAYOUT_RETURNED")
+
+# B2: item-level payout lifecycle — เงินถึงมือผู้รับแต่ละรายจริงไหม
+# Rollback: DROP TABLE payout_items (task/operations ไม่กระทบ)
+PAYOUT_ITEMS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS payout_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL,
+    payout_item_id TEXT UNIQUE,       -- PayPal's ID (อาจ NULL จนกว่าจะรู้)
+    transaction_id TEXT,
+    sender_item_id TEXT,              -- stable key ของเรา (judgepay-{task}-payout-item1)
+    receiver TEXT NOT NULL,
+    amount REAL NOT NULL,
+    currency TEXT NOT NULL,
+    item_status TEXT NOT NULL,        -- PAID|PENDING|UNCLAIMED|FAILED|RETURNED|CANCELED|NEEDS_RECONCILIATION
+    paypal_status TEXT NOT NULL,      -- transaction_status ดิบจาก PayPal
+    batch_id TEXT,
+    batch_status TEXT,                -- batch-level (informational เท่านั้น)
+    error_name TEXT,
+    error_message TEXT,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_payout_items_task ON payout_items(task_id);
+"""
 
 # คอลัมน์ที่เพิ่มหลัง schema แรก — migrate ให้ DB เก่าอัตโนมัติ
 _MIGRATIONS = (
@@ -106,6 +133,7 @@ class TaskStore:
         with self._conn() as c:
             c.executescript(SCHEMA)
             c.executescript(OPERATIONS_SCHEMA)
+            c.executescript(PAYOUT_ITEMS_SCHEMA)
             cols = {r[1] for r in c.execute("PRAGMA table_info(tasks)").fetchall()}
             for name, ddl in _MIGRATIONS:
                 if name not in cols:
@@ -248,3 +276,66 @@ class TaskStore:
                     (to_status, utcnow(), idempotency_key),
                 )
             return True
+
+    # ---------- B2: item-level payout lifecycle ----------
+
+    def upsert_payout_item(self, task_id, payout_item_id=None, transaction_id="",
+                           sender_item_id="", receiver="", amount=0.0, currency="",
+                           item_status="", paypal_status="", batch_id="",
+                           batch_status="", error_name="", error_message=""):
+        """insert หรือ update แถว item — จับคู่ด้วย payout_item_id (PayPal's ID).
+
+        ถ้ายังไม่มี payout_item_id (ยังไม่รู้) จับคู่ด้วย (task_id, sender_item_id)
+        แถวที่ payout_item_id IS NULL แทน. SQLite อนุญาต UNIQUE หลาย NULL ได้
+        เลยต้องจับคู่เองไม่พึ่ง ON CONFLICT.
+        """
+        now = utcnow()
+        with self._conn() as c:
+            row = None
+            if payout_item_id:
+                row = c.execute(
+                    "SELECT id FROM payout_items WHERE payout_item_id = ?",
+                    (payout_item_id,),
+                ).fetchone()
+            if row is None and sender_item_id:
+                row = c.execute(
+                    """SELECT id FROM payout_items
+                       WHERE task_id = ? AND sender_item_id = ?
+                       AND payout_item_id IS NULL""",
+                    (task_id, sender_item_id),
+                ).fetchone()
+            if row:
+                c.execute(
+                    """UPDATE payout_items SET
+                           payout_item_id = COALESCE(?, payout_item_id),
+                           transaction_id = ?, sender_item_id = ?,
+                           receiver = ?, amount = ?, currency = ?,
+                           item_status = ?, paypal_status = ?,
+                           batch_id = ?, batch_status = ?,
+                           error_name = ?, error_message = ?, updated_at = ?
+                       WHERE id = ?""",
+                    (payout_item_id, transaction_id, sender_item_id,
+                     receiver, amount, currency, item_status, paypal_status,
+                     batch_id, batch_status, error_name, error_message,
+                     now, row["id"]),
+                )
+            else:
+                c.execute(
+                    """INSERT INTO payout_items
+                       (task_id, payout_item_id, transaction_id, sender_item_id,
+                        receiver, amount, currency, item_status, paypal_status,
+                        batch_id, batch_status, error_name, error_message, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (task_id, payout_item_id, transaction_id, sender_item_id,
+                     receiver, amount, currency, item_status, paypal_status,
+                     batch_id, batch_status, error_name, error_message, now),
+                )
+        return self.list_payout_items(task_id)
+
+    def list_payout_items(self, task_id):
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM payout_items WHERE task_id = ? ORDER BY id",
+                (task_id,),
+            ).fetchall()
+        return [dict(r) for r in rows]

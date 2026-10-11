@@ -377,6 +377,53 @@ class PayPalClient:
                 return self.get_payout_batch(orig)
             raise
 
+    def _mock_build_payout_items(self, email, amount, currency, item_key,
+                                   batch_status):
+        """สร้าง mock payout items — จำลอง shape จริงของ PayPal.
+
+        PAYPAL_MOCK_ITEMS_JSON: '[{"transaction_status":"UNCLAIMED",...}, ...]'
+          สำหรับ multi-item / mixed-status test
+        PAYPAL_MOCK_ITEM_STATUS: บังคับ item เดียว (batch status ไม่เปลี่ยน) —
+          จำลองเคสจริง batch SUCCESS แต่ item UNCLAIMED
+        ค่าเริ่มต้น: item เดียว สถานะตาม batch (เหมือนจริง: batch PENDING -> item PENDING)
+        """
+        import json as _json
+        specs = None
+        items_json = os.getenv("PAYPAL_MOCK_ITEMS_JSON", "")
+        if items_json:
+            try:
+                specs = _json.loads(items_json)
+            except ValueError:
+                specs = None
+        if specs is None:
+            forced = os.getenv("PAYPAL_MOCK_ITEM_STATUS", "")
+            specs = [{"transaction_status": forced or batch_status}]
+        items = []
+        for i, spec in enumerate(specs):
+            st = str(spec.get("transaction_status", "SUCCESS")).upper()
+            rec = spec.get("receiver", email)
+            val = spec.get("amount", f"{amount:.2f}")
+            item = {
+                "payout_item_id": _fake_id(),
+                "transaction_id": _fake_id(),
+                "transaction_status": st,
+                "payout_batch_id": "",  # เติมตอนสร้าง batch
+                "payout_item": {
+                    "receiver": rec,
+                    "amount": {"currency": currency, "value": str(val)},
+                    "sender_item_id": (spec.get("sender_item_id")
+                                       or (item_key if i == 0 else f"{item_key}-{i}")),
+                },
+            }
+            if st in ("FAILED", "DENIED", "BLOCKED"):
+                item["errors"] = {
+                    "name": spec.get("error_name", "RECEIVER_UNCONFIRMED"),
+                    "message": spec.get("error_message",
+                                        "Receiver cannot receive payment"),
+                }
+            items.append(item)
+        return items
+
     def _payout_send(self, email, amount, currency, note, batch_key, item_key):
         fail_mode = os.getenv("PAYPAL_MOCK_FAIL_MODE", "")
         if self.mock:
@@ -403,8 +450,14 @@ class PayPalClient:
                 # test seam: PAYPAL_MOCK_PAYOUT_STATUS=PENDING/UNCLAIMED/DENIED ไว้เทส path ไม่สำเร็จ
                 status = os.getenv("PAYPAL_MOCK_PAYOUT_STATUS", "SUCCESS").upper()
                 batch_id = _fake_id()
+                items = self._mock_build_payout_items(email, amount, currency,
+                                                      item_key, status)
+                for it in items:
+                    it["payout_batch_id"] = batch_id
                 self._payouts[batch_id] = {"status": status, "receiver": email,
-                                           "amount": f"{amount:.2f}"}
+                                           "amount": f"{amount:.2f}",
+                                           "items": items,
+                                           "sender_batch_id": batch_key}
                 result = {"batch_id": batch_id, "status": status}
                 self._payout_idem[batch_key] = result
                 self._save_mock()
@@ -445,14 +498,70 @@ class PayPalClient:
         return {"batch_id": payout_batch_id, "status": status}
 
     def get_payout_batch(self, batch_id):
-        """poll สถานะ payout batch (ไว้ reconcile)."""
+        """ดึง batch + items — B2: item-level คือตัวตัดสินว่าเงินถึงมือจริงไหม.
+
+        คืน {"batch_id", "status" (batch_status), "items": [...]} โดย item แต่ละตัว
+        เป็น shape มาตรฐาน: {payout_item_id, transaction_id, transaction_status,
+        receiver, amount: {currency, value}, errors?}
+        """
         if self.mock:
             p = self._payouts.get(batch_id)
             if not p:
                 raise PayPalError(f"mock: unknown payout batch {batch_id}")
             return {"batch_id": batch_id, "status": p["status"],
-                    "receiver": p.get("receiver"), "amount": p.get("amount")}
+                    "receiver": p.get("receiver"), "amount": p.get("amount"),
+                    "items": [self._normalize_mock_item(it)
+                              for it in p.get("items", [])]}
         res = self._get(f"/v1/payments/payouts/{batch_id}")
         header = res.get("batch_header", {}) or {}
         return {"batch_id": header.get("payout_batch_id", batch_id),
-                "status": header.get("batch_status")}
+                "status": header.get("batch_status"),
+                "items": [self._normalize_real_item(it)
+                          for it in (res.get("items") or [])]}
+
+    @staticmethod
+    def _normalize_mock_item(it):
+        pi = it.get("payout_item", {}) or {}
+        amt = pi.get("amount", {}) or {}
+        return {
+            "payout_item_id": it.get("payout_item_id"),
+            "transaction_id": it.get("transaction_id", ""),
+            "transaction_status": it.get("transaction_status", ""),
+            "receiver": pi.get("receiver", ""),
+            "amount": {"currency": (amt.get("currency") or "").upper(),
+                       "value": str(amt.get("value", "0"))},
+            "sender_item_id": pi.get("sender_item_id", ""),
+            **({"errors": it["errors"]} if it.get("errors") else {}),
+        }
+
+    @staticmethod
+    def _normalize_real_item(it):
+        # shape จริง: {payout_item_id, transaction_id, transaction_status,
+        #   payout_batch_id, payout_item: {receiver, amount: {currency_code, value}},
+        #   errors?: {name, message, ...}}
+        pi = it.get("payout_item", {}) or {}
+        amt = pi.get("amount", {}) or {}
+        norm = {
+            "payout_item_id": it.get("payout_item_id"),
+            "transaction_id": it.get("transaction_id", ""),
+            "transaction_status": it.get("transaction_status", ""),
+            "receiver": pi.get("receiver", ""),
+            "amount": {"currency": (amt.get("currency_code")
+                                    or amt.get("currency") or "").upper(),
+                       "value": str(amt.get("value", "0"))},
+            "sender_item_id": pi.get("sender_item_id", ""),
+        }
+        if it.get("errors"):
+            norm["errors"] = it["errors"]
+        return norm
+
+    def get_payout_item(self, payout_item_id):
+        """ดึง payout item เดี่ยว — ไว้ polling / B5."""
+        if self.mock:
+            for b in self._payouts.values():
+                for it in b.get("items", []):
+                    if it.get("payout_item_id") == payout_item_id:
+                        return self._normalize_mock_item(it)
+            raise PayPalError(f"mock: unknown payout item {payout_item_id}")
+        res = self._get(f"/v1/payments/payouts-item/{payout_item_id}")
+        return self._normalize_real_item(res)

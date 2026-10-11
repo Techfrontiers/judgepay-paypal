@@ -10,6 +10,7 @@
   judge        AI ตัดสินอย่างเดียว (ไม่แตะเงิน)
   settle       มนุษย์ยืนยัน settlement (ออก confirmation token ให้เอง)
   reconcile    เทียบ DB กับ PayPal จริงแล้วซ่อมสถานะ
+  payout-status ดึง item-level payout truth จาก PayPal (B2)
   expire       หมดเวลา -> void
   list         รายการ task
 ทุกคำสั่งพิมพ์ JSON เหมือนต้นฉบับ
@@ -81,6 +82,10 @@ def main():
     p.add_argument("--all", action="store_true",
                    help="reconcile ทุก operation ที่ค้างทั่ว DB (ใช้ตอน start/cron)")
 
+    p = sub.add_parser("payout-status",
+                       help="Refresh item-level payout truth from PayPal (B2)")
+    p.add_argument("task_id", type=int)
+
     p = sub.add_parser("expire", help="Expire a task")
     p.add_argument("task_id", type=int)
 
@@ -132,6 +137,8 @@ def main():
                 result = svc.reconcile(args.task_id)
         elif args.command == "expire":
             result = svc.expire_task(args.task_id)
+        elif args.command == "payout-status":
+            result = svc.refresh_payout(args.task_id)
         elif args.command == "list":
             result = svc.list_tasks(args.status)
         else:

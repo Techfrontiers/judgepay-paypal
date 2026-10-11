@@ -35,6 +35,7 @@ from .judge import AIJudge
 from .policy import (
     APPROVE_THRESHOLD, REVIEW_MIN, evaluate_policy, normalize_verdict,
 )
+from .payout_status import normalize_payout_item, aggregate_task_status
 
 # กันงานขยะ: output ยาวเกินนี้ไม่รับ
 MAX_OUTPUT_LEN = 20000
@@ -392,12 +393,15 @@ class EscrowService:
                 "note": f"payout batch status is {payout.get('status')}, "
                         "not SUCCESS — not marked COMPLETED",
             }
-        self.store.update_task(task_id, status="COMPLETED")
+        # B2: batch ได้รับการยืนยันแล้ว — อย่าเพิ่งประกาศ COMPLETED
+        # ถาม item-level truth (เงินถึงมือผู้รับจริงไหม) แล้วใช้คำตอบนั้น
+        rp = self.refresh_payout(task_id)
         return {
             "success": True, "task_id": task_id,
             "verdict": task["judge_verdict"], "score": task["judge_score"],
             "capture_id": cap["capture_id"], "payout": payout,
-            "status": "COMPLETED",
+            "payout_items": rp["items"],
+            "status": rp["task_status"],
         }
 
     def _settle_reject(self, task_id, verdict):
@@ -416,6 +420,93 @@ class EscrowService:
             "reasoning": verdict["reasoning"],
             "void_status": void["status"], "status": "REFUNDED",
         }
+
+    # ---------- B2: item-level payout lifecycle ----------
+
+    def refresh_payout(self, task_id):
+        """ดึง item-level truth จาก PayPal แล้วปรับ task status — B2.
+
+        - upsert payout_items ทุก item (จับคู่ด้วย payout_item_id)
+        - task status มาจาก aggregate ของ item states เท่านั้น —
+          batch SUCCESS อย่างเดียวไม่พอ (เคสจริง: batch SUCCESS แต่ item UNCLAIMED)
+        - PayPal ล่ม / response ผิดรูป / ไม่มี items: เก็บ state เดิมไว้;
+          ถ้ายังไม่เคยมีข้อมูลดี -> task NEEDS_RECONCILIATION
+        - ไม่ raise ยกเว้น task ไม่เจอ (คืน dict มี note เสมอ)
+        """
+        task = self._require(task_id)
+        batch_id = task.get("payout_batch_id")
+        actions = []
+        items_out = []
+        if not batch_id:
+            return {"success": False, "task_id": task_id,
+                    "task_status": task["status"], "items": [],
+                    "note": "no payout_batch_id — nothing to refresh",
+                    "actions": actions}
+        try:
+            b = self.paypal.get_payout_batch(batch_id)
+        except (PayPalError, requests.Timeout, requests.ConnectionError) as e:
+            actions.append(f"get_payout_batch failed, kept old state: {e}")
+            return self._refresh_fallback(task_id, task, batch_id, actions,
+                                          "paypal unreachable")
+        raw_items = b.get("items")
+        if not isinstance(raw_items, list) or not raw_items:
+            # response ผิดรูป / ไม่มี items — อย่าเดา เก็บของเดิมไว้
+            actions.append("batch response has no items list — kept old state")
+            return self._refresh_fallback(task_id, task, batch_id, actions,
+                                          "malformed batch response")
+        batch_status = b.get("status")
+        ours = []
+        for raw in raw_items:
+            norm = normalize_payout_item(raw)
+            norm["batch_id"] = batch_id
+            norm["batch_status"] = batch_status or ""
+            self.store.upsert_payout_item(task_id, **norm)
+            ours.append(norm["item_status"])
+            actions.append(
+                f"item {norm['payout_item_id'] or '?'}: "
+                f"{norm['paypal_status']} -> {norm['item_status']}")
+            items_out.append({
+                "payout_item_id": norm["payout_item_id"],
+                "receiver": norm["receiver"],
+                "amount": norm["amount"], "currency": norm["currency"],
+                "item_status": norm["item_status"],
+                "paypal_status": norm["paypal_status"],
+                "error": f"{norm['error_name']}: {norm['error_message']}".strip(": "),
+            })
+        new_status = aggregate_task_status(ours,
+                                           has_capture=bool(task.get("capture_id")))
+        actions.append(f"aggregate {ours} -> {new_status}")
+        if new_status != task["status"]:
+            self.store.update_task(task_id, status=new_status,
+                                   last_paypal_op=f"payout:{batch_id}")
+            actions.append(f"status {task['status']} -> {new_status}")
+        return {"success": True, "task_id": task_id, "task_status": new_status,
+                "batch_status": batch_status, "items": items_out,
+                "actions": actions}
+
+    def _refresh_fallback(self, task_id, task, batch_id, actions, reason):
+        """refresh ล้มเหลว (PayPal ล่ม/timeout/response ผิดรูป/ไม่มี items).
+
+        fail-closed: เก็บ item rows เดิมไว้ (ไม่ลบ) แต่ task ต้องเป็น
+        NEEDS_RECONCILIATION เสมอ — ของไม่ชัดห้ามคงสถานะดีไว้
+        (refresh รอบหน้าที่สำเร็จจะปรับกลับเองถ้าเงินถึงมือจริง).
+        """
+        if task["status"] != "NEEDS_RECONCILIATION":
+            self.store.update_task(task_id, status="NEEDS_RECONCILIATION",
+                                   last_paypal_op=f"payout:{batch_id}")
+            actions.append(f"{reason} -> NEEDS_RECONCILIATION (item rows kept)")
+        else:
+            actions.append(f"{reason} -- already NEEDS_RECONCILIATION")
+        existing = self.store.list_payout_items(task_id)
+        items_out = [{
+            "payout_item_id": r["payout_item_id"], "receiver": r["receiver"],
+            "amount": r["amount"], "currency": r["currency"],
+            "item_status": r["item_status"], "paypal_status": r["paypal_status"],
+            "error": f"{r['error_name'] or ''}: {r['error_message'] or ''}".strip(": "),
+        } for r in existing]
+        return {"success": False, "task_id": task_id,
+                "task_status": "NEEDS_RECONCILIATION",
+                "items": items_out, "note": reason, "actions": actions}
 
     # ---------- B1: idempotent operation executor ----------
 
@@ -452,12 +543,16 @@ class EscrowService:
         if st == "SUCCEEDED":
             # เคยสำเร็จแล้ว — คืนผลเดิม ไม่ยิง PayPal ซ้ำ
             if op_type == "payout" and op.get("paypal_ref"):
-                # batch status อาจเปลี่ยน (PENDING -> SUCCESS) — ถามของเดิม
+                # B2: batch status อาจเปลี่ยน (PENDING -> SUCCESS) และ item
+                # states ต้องทันสมัย — route ผ่าน refresh_payout (อ่านอย่างเดียว
+                # ไม่สร้างธุรกรรมใหม่)
                 try:
-                    b = self.paypal.get_payout_batch(op["paypal_ref"])
+                    rp = self.refresh_payout(task_id)
                     return {"replayed": True, "batch_id": op["paypal_ref"],
-                            "status": b.get("status")}
-                except PayPalError:
+                            "status": rp.get("batch_status"),
+                            "task_status": rp.get("task_status"),
+                            "payout_items": rp.get("items", [])}
+                except (PayPalError, EscrowError):
                     pass
             return {"replayed": True, **_ref_result(op_type, op)}
         if st == "NEEDS_RECONCILIATION" and not reconcile_mode:
@@ -570,22 +665,32 @@ class EscrowService:
             task = self.store.update_task(task_id, **updates)
             actions.append(f"backfilled task refs from ops: {sorted(updates)}")
         # 3. task-level truth จาก PayPal
-        auth = batch = None
+        # B2: payout ใช้ item-level truth (refresh_payout) — batch SUCCESS
+        # อย่างเดียวไม่พอ (เคสจริง: batch SUCCESS แต่ item UNCLAIMED)
+        auth = None
         if task.get("authorization_id"):
             try:
                 auth = self.paypal.get_authorization(task["authorization_id"])
                 actions.append(f"authorization {task['authorization_id']} -> {auth.get('status')}")
             except Exception as e:
                 actions.append(f"get_authorization failed: {e}")
+        new_status = task["status"]
         if task.get("payout_batch_id"):
             try:
-                batch = self.paypal.get_payout_batch(task["payout_batch_id"])
-                actions.append(f"payout batch {task['payout_batch_id']} -> {batch.get('status')}")
+                b = self.paypal.get_payout_batch(task["payout_batch_id"])
+                actions.append(f"payout batch {task['payout_batch_id']} -> {b.get('status')}")
+                if b.get("status") == "SUCCESS":
+                    rp = self.refresh_payout(task_id)
+                    task = self._require(task_id)
+                    new_status = rp["task_status"]
+                    actions.append(f"refresh_payout -> {new_status}")
+                    for a in rp["actions"]:
+                        actions.append(f"  item: {a}")
+                else:
+                    actions.append("batch not SUCCESS — item truth not queried, "
+                                   "kept state (fail-closed)")
             except Exception as e:
                 actions.append(f"get_payout_batch failed: {e}")
-        new_status = task["status"]
-        if task.get("capture_id") and batch and batch.get("status") == "SUCCESS":
-            new_status = "COMPLETED"
         elif auth and auth.get("status") == "VOIDED" and not task.get("capture_id"):
             new_status = "REFUNDED"
         if new_status != task["status"]:
