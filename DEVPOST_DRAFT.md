@@ -52,7 +52,7 @@ For real PayPal sandbox: `PAYPAL_MOCK=false` + sandbox `PAYPAL_CLIENT_ID`/`PAYPA
 
 ## Links
 - GitHub: https://github.com/Techfrontiers/judgepay-paypal (public, MIT License)
-- Demo video (< 3 min, YouTube): TODO
+- Demo video (< 3 min, YouTube): https://youtu.be/3N8EuYEG4oM
 - Live demo URL: TODO (or "run locally per instructions above")
 
 ## Known limitations (honest)
